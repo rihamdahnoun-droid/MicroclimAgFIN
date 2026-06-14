@@ -1,0 +1,184 @@
+#' Clean and Preprocess LST Data
+#'
+#' @description
+#' Cleans Land Surface Temperature (LST) raster data by removing outliers,
+#' handling missing values (NA), harmonizing resolution, and applying
+#' simple interpolation to fill gaps.
+#'
+#' @param lst SpatRaster. LST raster object returned by download_lst_data().
+#' @param temp_min Numeric. Minimum valid temperature in Celsius. Default is -20.
+#' @param temp_max Numeric. Maximum valid temperature in Celsius. Default is 60.
+#' @param fill_na Logical. Whether to fill NA values by interpolation. Default is TRUE.
+#' @param target_res Numeric. Target resolution in degrees. NULL keeps original. Default is NULL.
+#' @param output_dir Character. Directory to save cleaned raster. Default is "outputs/maps".
+#' @param save Logical. Whether to save the cleaned raster. Default is TRUE.
+#'
+#' @return A cleaned SpatRaster object.
+#'
+#' @examples
+#' \dontrun{
+#' lst_raw     <- download_lst_data(country="MAR", region="Souss-Massa",
+#'                                   year=2022, month=c(6,7,8))
+#' lst_clean   <- clean_lst_data(lst_raw)
+#' }
+#'
+#' @importFrom terra nlyr values classify focal res resample writeRaster ifel
+#' @export
+clean_lst_data <- function(lst,
+                           temp_min = -20,
+                           temp_max = 60,
+                           fill_na = TRUE,
+                           target_res = NULL,
+                           output_dir = "outputs/maps",
+                           save = TRUE,
+                           plot_compare = FALSE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(lst, "SpatRaster")) {
+    stop("Input must be a SpatRaster object (from terra package).")
+  }
+
+  message("========================================")
+  message("   microclimAg — LST Cleaning          ")
+  message("========================================\n")
+  message("Input layers   : ", terra::nlyr(lst))
+  message("Layer names    : ", paste(names(lst), collapse = ", "))
+
+  # Stats avant nettoyage
+  vals_before <- terra::values(lst)
+  n_total     <- sum(!is.na(vals_before))
+  n_na_before <- sum(is.na(vals_before))
+
+  message("\nBefore cleaning:")
+  message("  Valid pixels : ", n_total)
+  message("  NA pixels    : ", n_na_before)
+  message("  Temp range   : ",
+          round(min(vals_before, na.rm = TRUE), 1), "C to ",
+          round(max(vals_before, na.rm = TRUE), 1), "C")
+
+  # ============================================================
+  # BLOC 2 — Suppression des valeurs aberrantes
+  # ============================================================
+
+  message("\nRemoving outliers (valid range: ", temp_min, "C to ", temp_max, "C)...")
+
+  lst_clean <- terra::ifel(lst < temp_min | lst > temp_max, NA, lst)
+
+  vals_after_outlier <- terra::values(lst_clean)
+  n_removed          <- sum(is.na(vals_after_outlier)) - n_na_before
+
+  message("  Outlier pixels removed: ", max(0, n_removed))
+
+  # ============================================================
+  # BLOC 3 — Harmonisation de la résolution
+  # ============================================================
+
+  if (!is.null(target_res)) {
+    current_res <- terra::res(lst_clean)[1]
+
+    if (abs(current_res - target_res) > 1e-6) {
+      message("\nResampling from ", round(current_res, 5),
+              " to ", target_res, " degrees...")
+
+      template <- terra::rast(
+        extent = terra::ext(lst_clean),
+        resolution = target_res,
+        crs = terra::crs(lst_clean)
+      )
+
+      lst_clean <- terra::resample(lst_clean, template, method = "bilinear")
+      message("  Resampling done.")
+    } else {
+      message("\nResolution already at target (", target_res, " degrees). Skipping.")
+    }
+  }
+
+  # ============================================================
+  # BLOC 4 — Interpolation des NA (focal mean)
+  # ============================================================
+
+  if (fill_na) {
+    message("\nFilling NA values using focal interpolation (3x3 window)...")
+
+    lst_filled <- lst_clean
+
+    for (i in seq_len(terra::nlyr(lst_clean))) {
+      layer     <- lst_clean[[i]]
+      na_before <- sum(is.na(terra::values(layer)))
+
+      if (na_before > 0) {
+        # Focal mean pour remplir les NA
+        filled <- terra::focal(
+          layer,
+          w   = matrix(1, 3, 3),
+          fun = "mean",
+          na.policy = "only",
+          na.rm = TRUE
+        )
+
+        # Remplacer uniquement les NA
+        layer_filled <- terra::ifel(is.na(layer), filled, layer)
+        lst_filled[[i]] <- layer_filled
+
+        na_after <- sum(is.na(terra::values(layer_filled)))
+        message("  Layer ", names(lst_clean)[i],
+                ": ", na_before, " NA -> ", na_after, " NA remaining")
+      } else {
+        message("  Layer ", names(lst_clean)[i], ": no NA values, skipping.")
+      }
+    }
+
+    lst_clean <- lst_filled
+  }
+
+  # ============================================================
+  # BLOC 5 — Statistiques après nettoyage
+  # ============================================================
+
+  vals_final  <- terra::values(lst_clean)
+  n_na_final  <- sum(is.na(vals_final))
+
+  message("\nAfter cleaning:")
+  message("  Valid pixels : ", sum(!is.na(vals_final)))
+  message("  NA pixels    : ", n_na_final)
+  message("  Temp range   : ",
+          round(min(vals_final, na.rm = TRUE), 1), "C to ",
+          round(max(vals_final, na.rm = TRUE), 1), "C")
+
+  # ============================================================
+  # BLOC 6 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    out_file <- file.path(output_dir, "LST_cleaned.tif")
+    terra::writeRaster(lst_clean, out_file, overwrite = TRUE)
+    message("\nCleaned LST saved to: ", out_file)
+  }
+
+  # ============================================================
+  # BLOC 7 — Visualisation (optionnelle)
+  # ============================================================
+
+  if (plot_compare && inherits(lst, "SpatRaster") && inherits(lst_clean, "SpatRaster")) {
+
+    message("\nPlotting before/after comparison...")
+
+    old_par <- par(mfrow = c(1, 2))
+    on.exit(par(old_par), add = TRUE)
+
+    terra::plot(lst[[1]],
+                main = paste("BEFORE cleaning\n", names(lst)[1]),
+                col  = rev(heat.colors(100)))
+
+    terra::plot(lst_clean[[1]],
+                main = paste("AFTER cleaning\n", names(lst_clean)[1]),
+                col  = rev(heat.colors(100)))
+  }
+
+  return(lst_clean)
+}

@@ -1,0 +1,26 @@
+{
+    "id": "8C398B36",
+    "path": "C:/VERRPACK/MICROCLIMATAGFIN/R/download_lst_data.R",
+    "project_path": "R/download_lst_data.R",
+    "type": "r_source",
+    "hash": "1213335325",
+    "contents": "",
+    "dirty": false,
+    "created": 1781450167188.0,
+    "source_on_save": false,
+    "relative_order": 4,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "127,0",
+        "scrollLine": "105"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1781450195,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1781450195890,
+    "read_only": false,
+    "read_only_alternatives": []
+}
