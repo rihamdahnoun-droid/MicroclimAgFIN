@@ -1,0 +1,617 @@
+#' Generate Automated Microclimate Analysis Report
+#'
+#' @description
+#' Generates a comprehensive HTML or PDF report summarizing a complete
+#' microclimate analysis. The report includes thermal statistics, LST maps,
+#' NDVI comparison, anomalies, cluster analysis, and spatial autocorrelation.
+#' The function assembles all results from the microclimAg pipeline into a
+#' single readable document using R Markdown.
+#'
+#' @param lst SpatRaster. Cleaned LST raster. Required.
+#' @param ndvi SpatRaster. NDVI raster. Optional.
+#' @param anomaly_result List. Output from calculate_lst_anomaly(). Optional.
+#' @param cluster_result List. Output from cluster_thermal_zones(). Optional.
+#' @param model_result List. Output from model_temperature_relationships(). Optional.
+#' @param corr_result List. Output from compare_lst_vs_ndvi(). Optional.
+#' @param autocorr_result List. Output from analyze_spatial_correlation(). Optional.
+#' @param weather_data Data frame. Output from import_weather_data(). Optional.
+#' @param country Character. Country ISO3 code (for report metadata). Default is "".
+#' @param region Character. Region name (for report metadata). Default is "".
+#' @param period Character. Study period description (e.g. "June–August 2022").
+#'   Default is "".
+#' @param author Character. Author name for report header. Default is "microclimAg".
+#' @param output_format Character. Report format: "html", "pdf", or "both".
+#'   Default is "html".
+#' @param output_dir Character. Directory to save the report. Default is "outputs/reports".
+#' @param open_report Logical. Whether to open the report after generation.
+#'   Default is TRUE.
+#'
+#' @return Character vector of paths to the generated report file(s).
+#'
+#' @examples
+#' \dontrun{
+#' generate_report(
+#'   lst            = lst_clean,
+#'   ndvi           = ndvi,
+#'   anomaly_result = anomalies,
+#'   cluster_result = zones,
+#'   country        = "MAR",
+#'   region         = "Souss-Massa",
+#'   period         = "June-August 2022",
+#'   output_format  = "html"
+#' )
+#' }
+#'
+#' @importFrom terra nlyr values global mean
+#' @export
+generate_report <- function(lst,
+                            ndvi             = NULL,
+                            anomaly_result   = NULL,
+                            cluster_result   = NULL,
+                            model_result     = NULL,
+                            corr_result      = NULL,
+                            autocorr_result  = NULL,
+                            weather_data     = NULL,
+                            country          = "",
+                            region           = "",
+                            period           = "",
+                            author           = "microclimAg",
+                            output_format    = "html",
+                            output_dir       = "outputs/reports",
+                            open_report      = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(lst, "SpatRaster")) {
+    stop("lst must be a SpatRaster object.")
+  }
+  if (!output_format %in% c("html", "pdf", "both")) {
+    stop("output_format must be 'html', 'pdf', or 'both'.")
+  }
+  if (!requireNamespace("rmarkdown", quietly = TRUE)) {
+    stop("Package 'rmarkdown' is required. Install with: install.packages('rmarkdown')")
+  }
+
+  message("========================================")
+  message("  microclimAg — Report Generation      ")
+  message("========================================\n")
+  message("Country       : ", ifelse(country == "", "Not specified", country))
+  message("Region        : ", ifelse(region  == "", "Not specified", region))
+  message("Period        : ", ifelse(period  == "", "Not specified", period))
+  message("Output format : ", output_format)
+
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  # ============================================================
+  # BLOC 2 — Calculer les statistiques résumées
+  # ============================================================
+
+  message("\nComputing summary statistics...")
+
+  lst_vals   <- terra::values(terra::mean(lst, na.rm = TRUE))[, 1]
+  lst_vals   <- lst_vals[!is.na(lst_vals)]
+
+  lst_stats <- list(
+    n_layers = terra::nlyr(lst),
+    mean     = round(mean(lst_vals), 2),
+    sd       = round(sd(lst_vals),   2),
+    min      = round(min(lst_vals),  2),
+    max      = round(max(lst_vals),  2),
+    q25      = round(quantile(lst_vals, 0.25), 2),
+    q75      = round(quantile(lst_vals, 0.75), 2)
+  )
+
+  ndvi_stats <- NULL
+  if (!is.null(ndvi)) {
+    ndvi_vals  <- terra::values(terra::mean(ndvi, na.rm = TRUE))[, 1]
+    ndvi_vals  <- ndvi_vals[!is.na(ndvi_vals)]
+    ndvi_stats <- list(
+      mean = round(mean(ndvi_vals), 3),
+      sd   = round(sd(ndvi_vals),   3),
+      min  = round(min(ndvi_vals),  3),
+      max  = round(max(ndvi_vals),  3)
+    )
+  }
+
+  # ============================================================
+  # BLOC 3 — Préparer les figures temporaires
+  # ============================================================
+
+  message("Generating figures...")
+
+  temp_fig_dir <- file.path(tempdir(), "microclimag_figs")
+  if (!dir.exists(temp_fig_dir)) dir.create(temp_fig_dir)
+
+  pal_lst <- colorRampPalette(c(
+    "#313695","#4575B4","#74ADD1","#ABD9E9",
+    "#FFFFBF","#FEE090","#FDAE61","#F46D43","#D73027","#A50026"
+  ))(100)
+  pal_ndvi <- colorRampPalette(c(
+    "#8B4513","#D2B48C","#FFFFE0","#90EE90","#228B22","#006400"
+  ))(100)
+  pal_anom <- colorRampPalette(c(
+    "#2166AC","#92C5DE","#F7F7F7","#F4A582","#D6604D","#B2182B"
+  ))(100)
+
+  fig_paths <- list()
+
+  # Figure 1 : LST mean
+  f1 <- file.path(temp_fig_dir, "fig_lst_mean.png")
+  png(f1, width = 900, height = 700, res = 120)
+  plot(terra::mean(lst, na.rm = TRUE),
+       col  = pal_lst,
+       main = paste("Mean Land Surface Temperature\n",
+                    ifelse(region != "", region, country), period))
+  dev.off()
+  fig_paths[["lst_mean"]] <- f1
+  message("  Figure 1: LST mean ✓")
+
+  # Figure 2 : NDVI mean (si disponible)
+  if (!is.null(ndvi)) {
+    f2 <- file.path(temp_fig_dir, "fig_ndvi_mean.png")
+    png(f2, width = 900, height = 700, res = 120)
+    plot(terra::mean(ndvi, na.rm = TRUE),
+         col  = pal_ndvi,
+         main = paste("Mean NDVI\n",
+                      ifelse(region != "", region, country), period))
+    dev.off()
+    fig_paths[["ndvi_mean"]] <- f2
+    message("  Figure 2: NDVI mean ✓")
+  }
+
+  # Figure 3 : Anomalies
+  if (!is.null(anomaly_result) && !is.null(anomaly_result$anomaly)) {
+    f3 <- file.path(temp_fig_dir, "fig_anomaly.png")
+    png(f3, width = 900, height = 700, res = 120)
+    plot(terra::mean(anomaly_result$anomaly, na.rm = TRUE),
+         col  = pal_anom,
+         main = "Mean Thermal Anomaly")
+    dev.off()
+    fig_paths[["anomaly"]] <- f3
+    message("  Figure 3: Anomaly ✓")
+  }
+
+  # Figure 4 : Clusters
+  if (!is.null(cluster_result) && !is.null(cluster_result$cluster_raster)) {
+    n_k <- cluster_result$optimal_k
+    zone_pal <- colorRampPalette(
+      c("#4575B4","#91BFDB","#FEE090","#FC8D59","#D73027")
+    )(n_k)
+    f4 <- file.path(temp_fig_dir, "fig_clusters.png")
+    png(f4, width = 900, height = 700, res = 120)
+    plot(cluster_result$cluster_raster,
+         col  = zone_pal,
+         main = paste("Thermal Zones (k =", n_k, ")"))
+    dev.off()
+    fig_paths[["clusters"]] <- f4
+    message("  Figure 4: Clusters ✓")
+  }
+
+  # Figure 5 : Corrélation LST-NDVI
+  if (!is.null(corr_result) && !is.null(ndvi)) {
+    f5 <- file.path(temp_fig_dir, "fig_corr_ts.png")
+    png(f5, width = 1000, height = 500, res = 120)
+    ts_df <- corr_result$time_series
+    n_l   <- nrow(ts_df)
+    par(mfrow = c(1, 2))
+    plot(seq_len(n_l), ts_df$mean_lst,
+         type = "b", pch = 16, col = "#D73027", lwd = 2,
+         xlab = "Layer", ylab = "Mean (standardized)",
+         main = "LST & NDVI Time Series")
+    lines(seq_len(n_l),
+          (ts_df$mean_ndvi - min(ts_df$mean_ndvi, na.rm=TRUE)) /
+            (max(ts_df$mean_ndvi, na.rm=TRUE) - min(ts_df$mean_ndvi, na.rm=TRUE)) *
+            diff(range(ts_df$mean_lst, na.rm=TRUE)) +
+            min(ts_df$mean_lst, na.rm=TRUE),
+          type = "b", pch = 15, col = "#1A9641", lwd = 2)
+    legend("topright", legend = c("LST", "NDVI (scaled)"),
+           col = c("#D73027", "#1A9641"), lwd = 2, bty = "n")
+
+    barplot(corr_result$global_corr$pearson,
+            names.arg = seq_len(nrow(corr_result$global_corr)),
+            col       = ifelse(corr_result$global_corr$pearson < 0,
+                               "#4575B4", "#D73027"),
+            main      = "Pearson r (LST~NDVI) per Layer",
+            ylab      = "Pearson r",
+            xlab      = "Layer",
+            border    = "white")
+    abline(h = 0, lty = 2)
+    par(mfrow = c(1, 1))
+    dev.off()
+    fig_paths[["corr"]] <- f5
+    message("  Figure 5: Correlation ✓")
+  }
+
+  # Figure 6 : LISA (autocorrélation spatiale)
+  if (!is.null(autocorr_result) && !is.null(autocorr_result$cluster_raster)) {
+    f6 <- file.path(temp_fig_dir, "fig_lisa.png")
+    cluster_colors <- c("#F0F0F0","#D73027","#4575B4","#FC8D59","#91BFDB")
+    png(f6, width = 900, height = 700, res = 120)
+    plot(autocorr_result$cluster_raster,
+         col  = cluster_colors,
+         main = paste0("LISA Clusters\nMoran's I = ",
+                       autocorr_result$moran_global$statistic))
+    dev.off()
+    fig_paths[["lisa"]] <- f6
+    message("  Figure 6: LISA ✓")
+  }
+
+  # ============================================================
+  # BLOC 4 — Construire le document Rmd
+  # ============================================================
+
+  message("\nBuilding R Markdown document...")
+
+  study_area <- paste(
+    ifelse(region != "", paste0(region, ", "), ""),
+    ifelse(country != "", country, "Study Area")
+  )
+
+  gen_date   <- format(Sys.Date(), "%B %d, %Y")
+
+  # --- Sections conditionnelles ---
+  ndvi_section <- if (!is.null(ndvi) && !is.null(ndvi_stats)) {
+    sprintf('
+## NDVI Analysis
+
+**Mean NDVI:** %.3f &nbsp;|&nbsp; **SD:** %.3f &nbsp;|&nbsp;
+**Range:** [%.3f — %.3f]
+
+Positive NDVI values indicate vegetated areas. Values above 0.3 typically
+represent dense vegetation (crops, forest). Bare soil and urban areas
+have values near 0, while water bodies may show negative NDVI.
+
+![NDVI Map](%s){width=90%%}
+',
+            ndvi_stats$mean, ndvi_stats$sd, ndvi_stats$min, ndvi_stats$max,
+            fig_paths[["ndvi_mean"]])
+  } else ""
+
+  anomaly_section <- if (!is.null(anomaly_result)) {
+    stats_a <- anomaly_result$stats
+    sprintf('
+## Thermal Anomalies
+
+The thermal anomaly analysis identifies pixels significantly warmer or
+cooler than the seasonal mean. Method: **%s**.
+
+| Layer | Mean Anomaly | Hot Zone (%%) | Cold Zone (%%) |
+|-------|-------------|--------------|---------------|
+%s
+
+![Anomaly Map](%s){width=90%%}
+',
+            if (!is.null(anomaly_result$stats)) "Mean Difference" else "Z-score",
+            paste(apply(stats_a, 1, function(r)
+              sprintf("| %s | %.2f°C | %.1f%% | %.1f%% |",
+                      r["layer"], as.numeric(r["mean_anom"]),
+                      as.numeric(r["hot_pct"]), as.numeric(r["cold_pct"]))),
+              collapse = "\n"),
+            if (!is.null(fig_paths[["anomaly"]])) fig_paths[["anomaly"]] else "")
+  } else ""
+
+  cluster_section <- if (!is.null(cluster_result)) {
+    cs <- cluster_result$cluster_stats
+    sprintf('
+## Thermal Zone Classification
+
+K-means clustering (k = %d) identified distinct thermal zones:
+
+| Zone | Label | Pixels (%%) | Mean LST (°C) | Min | Max |
+|------|-------|------------|--------------|-----|-----|
+%s
+
+![Thermal Clusters](%s){width=90%%}
+',
+            cluster_result$optimal_k,
+            paste(apply(cs, 1, function(r)
+              sprintf("| %s | %s | %.1f%% | %.2f | %.2f | %.2f |",
+                      r["cluster"], r["label"], as.numeric(r["pct_pixels"]),
+                      as.numeric(r["mean_lst"]), as.numeric(r["min_lst"]),
+                      as.numeric(r["max_lst"]))),
+              collapse = "\n"),
+            if (!is.null(fig_paths[["clusters"]])) fig_paths[["clusters"]] else "")
+  } else ""
+
+  model_section <- if (!is.null(model_result)) {
+    diag <- model_result$diagnostics
+    imp  <- model_result$importance
+    sprintf('
+## Temperature Modelling
+
+**Method:** %s
+
+**Model Performance:**
+
+| Metric | Value |
+|--------|-------|
+| R² | %.3f |
+| Adj. R² | %.3f |
+| RMSE | %.3f °C |
+| AIC | %.1f |
+
+**Top Predictors** (standardized coefficients):
+
+%s
+',
+            model_result$method,
+            diag$value[diag$metric == "R2"],
+            diag$value[diag$metric == "Adj_R2"],
+            diag$value[diag$metric == "RMSE"],
+            diag$value[diag$metric == "AIC"],
+            paste(apply(imp, 1, function(r)
+              sprintf("- **%s**: importance = %.1f%% (p = %.4f)",
+                      r["variable"], as.numeric(r["rel_importance"]),
+                      as.numeric(r["p_value"]))),
+              collapse = "\n"))
+  } else ""
+
+  corr_section <- if (!is.null(corr_result)) {
+    mean_r <- round(mean(corr_result$global_corr$pearson, na.rm = TRUE), 3)
+    sprintf('
+## LST vs NDVI Relationship
+
+**Mean Pearson r (LST ~ NDVI):** %.3f
+
+A negative correlation indicates that higher vegetation density
+is associated with lower surface temperatures — the cooling effect
+of vegetation.
+
+![LST-NDVI Time Series](%s){width=95%%}
+',
+            mean_r,
+            if (!is.null(fig_paths[["corr"]])) fig_paths[["corr"]] else "")
+  } else ""
+
+  autocorr_section <- if (!is.null(autocorr_result)) {
+    mg <- autocorr_result$moran_global
+    sprintf('
+## Spatial Autocorrelation
+
+**Global Moran\'s I:** %.4f (p = %s)
+
+**Interpretation:** %s
+
+The LISA (Local Indicator of Spatial Association) map shows the
+spatial distribution of thermal clusters:
+
+- **HH (Hot Spots):** Warm pixels surrounded by warm pixels
+- **LL (Cold Spots):** Cool pixels surrounded by cool pixels
+- **HL / LH:** Spatial outliers
+
+![LISA Cluster Map](%s){width=90%%}
+',
+            mg$statistic,
+            format(mg$p_value, digits = 3, scientific = TRUE),
+            mg$interpretation,
+            if (!is.null(fig_paths[["lisa"]])) fig_paths[["lisa"]] else "")
+  } else ""
+
+  weather_section <- if (!is.null(weather_data)) {
+    sprintf('
+## Weather Station Data
+
+**Period:** %s to %s
+**Stations:** %s
+**Mean Temperature:** %.1f°C
+**Temperature Range:** %.1f°C — %.1f°C
+',
+            min(weather_data$date),
+            max(weather_data$date),
+            paste(unique(weather_data$station_id), collapse = ", "),
+            mean(weather_data$temperature, na.rm = TRUE),
+            min(weather_data$temperature,  na.rm = TRUE),
+            max(weather_data$temperature,  na.rm = TRUE))
+  } else ""
+
+  # --- Template Rmd complet ---
+  rmd_content <- sprintf('---
+title: "microclimAg — Microclimate Analysis Report"
+subtitle: "%s | %s"
+author: "%s"
+date: "%s"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    self_contained: true
+    code_folding: hide
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+---
+
+# Executive Summary
+
+This report presents the results of a microclimate analysis performed using
+the **microclimAg** R package. The analysis combines Land Surface Temperature
+(LST), NDVI, and spatial statistics to characterize thermal patterns across
+the agricultural landscape.
+
+**Key Findings:**
+
+- Mean LST: **%.2f°C** (range: %.2f°C — %.2f°C)
+- LST variability (SD): **%.2f°C**
+%s
+- Layers analyzed: **%d**
+
+---
+
+# Study Area
+
+| Parameter | Value |
+|-----------|-------|
+| Country | %s |
+| Region | %s |
+| Period | %s |
+| Coordinate system | WGS84 (EPSG:4326) |
+| LST layers | %d |
+
+---
+
+# Land Surface Temperature (LST)
+
+Land Surface Temperature was obtained from WorldClim climatological baseline
+adjusted with Open-Meteo year-specific anomalies. Values represent maximum
+daily temperature in degrees Celsius.
+
+**LST Statistics:**
+
+| Metric | Value |
+|--------|-------|
+| Mean | %.2f °C |
+| Std. Dev. | %.2f °C |
+| Minimum | %.2f °C |
+| Maximum | %.2f °C |
+| 25th percentile | %.2f °C |
+| 75th percentile | %.2f °C |
+
+![LST Mean Map](%s){width=90%%}
+
+%s
+
+%s
+
+%s
+
+%s
+
+%s
+
+%s
+
+%s
+
+---
+
+# Methods
+
+## Data Sources
+
+| Variable | Source |
+|----------|--------|
+| LST | WorldClim v2.1 + Open-Meteo archive API |
+| NDVI | Open-Meteo ET0/Precipitation proxy + elevation variation |
+| Land Cover | ESA Land Cover (geodata package) |
+| Elevation | SRTM 30 arc-second (geodata package) |
+| Weather | User-provided CSV/Excel |
+
+## Software
+
+- **R** statistical environment
+- **terra**: raster analysis
+- **sf**: vector spatial data
+- **spdep**: spatial autocorrelation (Moran\'s I, LISA)
+- **gstat**: interpolation (IDW, kriging)
+- **geodata**: data download
+- **ggplot2**: visualization
+
+---
+
+# Outputs
+
+All outputs are saved to the `outputs/` directory:
+
+| Folder | Content |
+|--------|---------|
+| `outputs/maps/` | Raster files (.tif): LST, NDVI, anomalies, clusters |
+| `outputs/tables/` | CSV tables: statistics, correlations, model results |
+| `outputs/reports/` | This report |
+
+---
+
+*Report generated by microclimAg — %s*
+',
+                         study_area, period, author, gen_date,
+                         # Executive summary stats
+                         lst_stats$mean, lst_stats$min, lst_stats$max,
+                         lst_stats$sd,
+                         ifelse(!is.null(ndvi_stats),
+                                paste0("- Mean NDVI: **", ndvi_stats$mean, "**"), ""),
+                         lst_stats$n_layers,
+                         # Study area table
+                         ifelse(country != "", country, "—"),
+                         ifelse(region  != "", region,  "—"),
+                         ifelse(period  != "", period,  "—"),
+                         lst_stats$n_layers,
+                         # LST stats table
+                         lst_stats$mean, lst_stats$sd,
+                         lst_stats$min,  lst_stats$max,
+                         lst_stats$q25,  lst_stats$q75,
+                         # Figure LST
+                         fig_paths[["lst_mean"]],
+                         # Sections conditionnelles
+                         ndvi_section, anomaly_section, cluster_section,
+                         model_section, corr_section, autocorr_section,
+                         weather_section,
+                         # Footer
+                         format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+  )
+
+  # ============================================================
+  # BLOC 5 — Sauvegarder et rendre le Rmd
+  # ============================================================
+
+  rmd_path <- file.path(output_dir, "microclimate_report.Rmd")
+  writeLines(rmd_content, rmd_path)
+  message("  Rmd template written: ", rmd_path)
+
+  output_files <- character(0)
+  formats_to_render <- if (output_format == "both") c("html", "pdf") else output_format
+
+  for (fmt in formats_to_render) {
+    out_file <- file.path(output_dir,
+                          paste0("microclimate_report.", fmt))
+
+    rmd_format <- if (fmt == "html") "html_document" else "pdf_document"
+
+    message("\nRendering ", toupper(fmt), " report...")
+
+    tryCatch({
+      rmarkdown::render(
+        input         = rmd_path,
+        output_format = rmd_format,
+        output_file   = basename(out_file),
+        output_dir    = output_dir,
+        quiet         = TRUE
+      )
+      output_files <- c(output_files, out_file)
+      message("  Report generated: ", out_file)
+
+      if (open_report && fmt == "html" && interactive()) {
+        utils::browseURL(out_file)
+      }
+
+    }, error = function(e) {
+      message("  Error rendering ", fmt, ": ", e$message)
+      message("  The Rmd source is available at: ", rmd_path)
+    })
+  }
+
+  # ============================================================
+  # BLOC 6 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("    Report Generation Complete!")
+  message("========================================")
+  message("  Study area : ", study_area)
+  message("  Period     : ", ifelse(period != "", period, "—"))
+  message("  LST mean   : ", lst_stats$mean, " °C")
+  for (f in output_files) message("  Output     : ", f)
+  message("========================================")
+
+  invisible(output_files)
+}

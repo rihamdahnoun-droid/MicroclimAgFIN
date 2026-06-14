@@ -1,0 +1,35 @@
+
+library(devtools)
+
+# Générer automatiquement le NAMESPACE et les fichiers .Rd
+devtools::document()
+
+# Vérifier la documentation
+?calc_eto
+?calc_ndvi
+?analyser_rendement
+
+# Initialiser testthat
+usethis::use_testthat()
+
+# Créer les fichiers de tests
+usethis::use_test("evapotranspiration")
+usethis::use_test("ndvi")
+
+devtools::test()
+# Ou avec plus de détails :
+testthat::test_dir("tests/testthat/")
+
+# Vérification complète (simule la soumission au CRAN)
+#devtools::check()
+
+# Installer le package localement
+devtools::install()
+
+# Tester l'utilisation après installation
+library(microclimAg)
+
+
+
+remotes::install_github("zinebelgorai/agri-analysis")
+

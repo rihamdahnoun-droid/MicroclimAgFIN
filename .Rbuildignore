@@ -1,0 +1,7 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^LICENSE\.md$
+^README\.Rmd$
+^outputs$
+^data/weather_test\.csv$
+^data/stations_test\.csv$

@@ -1,0 +1,26 @@
+{
+    "id": "B8996D4F",
+    "path": "C:/VERRPACK/MICROCLIMATAGFIN/R/import_weather_data.R",
+    "project_path": "R/import_weather_data.R",
+    "type": "r_source",
+    "hash": "0",
+    "contents": "",
+    "dirty": false,
+    "created": 1781450134180.0,
+    "source_on_save": false,
+    "relative_order": 3,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "89,0",
+        "scrollLine": "67"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1781450161,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1781450161711,
+    "read_only": false,
+    "read_only_alternatives": []
+}

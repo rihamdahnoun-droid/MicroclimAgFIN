@@ -1,0 +1,348 @@
+#' Compare LST vs NDVI
+#'
+#' @description
+#' Analyzes the relationship between Land Surface Temperature (LST) and
+#' the Normalized Difference Vegetation Index (NDVI). Computes correlations,
+#' generates scatterplots, and performs seasonal analysis.
+#'
+#' @param lst SpatRaster. Cleaned LST raster from clean_lst_data().
+#' @param ndvi SpatRaster. NDVI raster from calculate_ndvi().
+#' @param features Data frame. Microclimate features from extract_microclimate_features().
+#' @param output_dir Character. Directory to save results. Default is "outputs/tables".
+#' @param save Logical. Whether to save results. Default is TRUE.
+#'
+#' @return A list containing:
+#' \describe{
+#'   \item{correlation}{Overall Pearson correlation between LST and NDVI}
+#'   \item{seasonal}{Data frame with monthly correlation statistics}
+#'   \item{scatter_data}{Data frame used for scatterplots}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' lst_ndvi <- compare_lst_vs_ndvi(
+#'   lst      = lst_clean,
+#'   ndvi     = ndvi,
+#'   features = features
+#' )
+#' }
+#'
+#' @importFrom terra values nlyr
+#' @importFrom stats cor cor.test
+#' @importFrom ggplot2 ggplot aes geom_point geom_smooth geom_bar geom_hline theme_minimal labs scale_color_gradientn facet_wrap scale_fill_gradient2
+#' @export
+compare_lst_vs_ndvi <- function(lst,
+                                ndvi,
+                                features   = NULL,
+                                output_dir = "outputs/tables",
+                                save       = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(lst,  "SpatRaster")) stop("lst must be a SpatRaster.")
+  if (!inherits(ndvi, "SpatRaster")) stop("ndvi must be a SpatRaster.")
+
+  message("========================================")
+  message("  microclimAg — LST vs NDVI Analysis   ")
+  message("========================================\n")
+  message("LST layers  : ", terra::nlyr(lst))
+  message("NDVI layers : ", terra::nlyr(ndvi))
+
+  # ============================================================
+  # BLOC 2 — Préparer les données
+  # ============================================================
+
+  message("\nPreparing data...")
+
+  if (!is.null(features) &&
+      "lst_mean" %in% names(features) &&
+      "ndvi_mean" %in% names(features)) {
+
+    # Utiliser features si disponible
+    scatter_df <- data.frame(
+      lst_mean  = features$lst_mean,
+      ndvi_mean = features$ndvi_mean,
+      x         = features$x,
+      y         = features$y
+    )
+
+    if ("elevation" %in% names(features)) {
+      scatter_df$elevation <- features$elevation
+    }
+
+    if ("landcover_label" %in% names(features)) {
+      scatter_df$landcover <- features$landcover_label
+    }
+
+    scatter_df <- scatter_df[complete.cases(scatter_df[,
+                                                       c("lst_mean", "ndvi_mean")]), ]
+
+    message("  Using features data frame.")
+    message("  Pixels: ", nrow(scatter_df))
+
+  } else {
+
+    # Extraire directement des rasters
+    lst_vals  <- terra::values(terra::mean(lst,  na.rm = TRUE))[, 1]
+    ndvi_vals <- terra::values(terra::mean(ndvi, na.rm = TRUE))[, 1]
+
+    scatter_df <- data.frame(
+      lst_mean  = lst_vals,
+      ndvi_mean = ndvi_vals
+    )
+    scatter_df <- scatter_df[complete.cases(scatter_df), ]
+    message("  Using raster values directly.")
+    message("  Pixels: ", nrow(scatter_df))
+  }
+
+  # ============================================================
+  # BLOC 3 — Corrélation globale
+  # ============================================================
+
+  message("\nCalculating overall LST-NDVI correlation...")
+
+  corr_test <- cor.test(
+    scatter_df$lst_mean,
+    scatter_df$ndvi_mean,
+    method = "pearson"
+  )
+
+  overall_corr <- round(corr_test$estimate, 4)
+  overall_p    <- round(corr_test$p.value,  6)
+
+  message("  Pearson r : ", overall_corr)
+  message("  p-value   : ", overall_p)
+
+  if (overall_p < 0.05) {
+    if (overall_corr < 0) {
+      message("  Result    : *** Significant NEGATIVE correlation ***")
+      message("              (higher vegetation = lower temperature)")
+    } else {
+      message("  Result    : *** Significant POSITIVE correlation ***")
+      message("              (higher vegetation = higher temperature)")
+    }
+  } else {
+    message("  Result    : No significant correlation (p > 0.05)")
+  }
+
+  # ============================================================
+  # BLOC 4 — Analyse par couche mensuelle
+  # ============================================================
+
+  message("\nCalculating monthly correlations...")
+
+  n_layers <- min(terra::nlyr(lst), terra::nlyr(ndvi))
+
+  seasonal_list <- lapply(seq_len(n_layers), function(i) {
+
+    lst_v  <- terra::values(lst[[i]])[,  1]
+    ndvi_v <- terra::values(ndvi[[i]])[, 1]
+
+    valid  <- !is.na(lst_v) & !is.na(ndvi_v)
+    lst_v  <- lst_v[valid]
+    ndvi_v <- ndvi_v[valid]
+
+    if (length(lst_v) < 10) {
+      return(data.frame(
+        layer       = i,
+        name        = names(lst)[i],
+        correlation = NA,
+        p_value     = NA,
+        mean_lst    = NA,
+        mean_ndvi   = NA,
+        n_pixels    = length(lst_v)
+      ))
+    }
+
+    ct <- cor.test(lst_v, ndvi_v, method = "pearson")
+
+    data.frame(
+      layer       = i,
+      name        = names(lst)[i],
+      correlation = round(ct$estimate, 4),
+      p_value     = round(ct$p.value,  6),
+      mean_lst    = round(mean(lst_v),  2),
+      mean_ndvi   = round(mean(ndvi_v), 3),
+      n_pixels    = length(lst_v)
+    )
+  })
+
+  seasonal_df <- do.call(rbind, seasonal_list)
+
+  message("\nMonthly LST-NDVI Correlations:")
+  print(seasonal_df[, c("name", "correlation", "p_value",
+                        "mean_lst", "mean_ndvi")])
+
+  # ============================================================
+  # BLOC 5 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    write.csv(seasonal_df,
+              file.path(output_dir, "lst_ndvi_seasonal_corr.csv"),
+              row.names = FALSE)
+
+    write.csv(
+      data.frame(
+        overall_correlation = overall_corr,
+        p_value             = overall_p,
+        n_pixels            = nrow(scatter_df)
+      ),
+      file.path(output_dir, "lst_ndvi_overall_corr.csv"),
+      row.names = FALSE
+    )
+
+    message("\nResults saved to: ", output_dir)
+  }
+
+  # ============================================================
+  # BLOC 6 — Visualisations
+  # ============================================================
+
+  message("\nPlotting LST vs NDVI analysis...")
+
+  # 1. Scatterplot global
+  p1 <- ggplot2::ggplot(
+    scatter_df,
+    ggplot2::aes(x = ndvi_mean, y = lst_mean)
+  ) +
+    ggplot2::geom_point(
+      ggplot2::aes(color = lst_mean),
+      alpha = 0.3,
+      size  = 0.8
+    ) +
+    ggplot2::scale_color_gradientn(
+      colors = rev(heat.colors(100)),
+      name   = "LST (C)"
+    ) +
+    ggplot2::geom_smooth(
+      method = "lm",
+      se     = TRUE,
+      color  = "black",
+      linewidth = 1
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title    = "LST vs NDVI — Overall Relationship",
+      subtitle = paste("Pearson r =", overall_corr,
+                       "| p =", overall_p,
+                       "| n =", nrow(scatter_df)),
+      x = "NDVI",
+      y = "LST (C)"
+    )
+
+  print(p1)
+
+  # 2. Corrélations mensuelles
+  seasonal_complete <- seasonal_df[!is.na(seasonal_df$correlation), ]
+
+  if (nrow(seasonal_complete) > 0) {
+    p2 <- ggplot2::ggplot(
+      seasonal_complete,
+      ggplot2::aes(x    = reorder(name, layer),
+                   y    = correlation,
+                   fill = correlation)
+    ) +
+      ggplot2::geom_bar(stat = "identity") +
+      ggplot2::geom_hline(
+        yintercept = 0,
+        linetype   = "dashed",
+        color      = "black"
+      ) +
+      ggplot2::scale_fill_gradient2(
+        low      = "#4575B4",
+        mid      = "white",
+        high     = "#D73027",
+        midpoint = 0,
+        name     = "Correlation"
+      ) +
+      ggplot2::theme_minimal() +
+      ggplot2::labs(
+        title    = "Monthly LST-NDVI Correlation",
+        subtitle = "Negative = vegetation cools the surface",
+        x        = "Month",
+        y        = "Pearson Correlation (r)"
+      )
+
+    print(p2)
+  }
+
+  # 3. Évolution mensuelle LST et NDVI
+  if (nrow(seasonal_complete) > 0) {
+
+    # Normaliser pour comparer sur le même axe
+    lst_norm  <- (seasonal_complete$mean_lst -
+                    min(seasonal_complete$mean_lst, na.rm = TRUE)) /
+      (max(seasonal_complete$mean_lst,  na.rm = TRUE) -
+         min(seasonal_complete$mean_lst, na.rm = TRUE))
+
+    ndvi_norm <- (seasonal_complete$mean_ndvi -
+                    min(seasonal_complete$mean_ndvi, na.rm = TRUE)) /
+      (max(seasonal_complete$mean_ndvi,  na.rm = TRUE) -
+         min(seasonal_complete$mean_ndvi, na.rm = TRUE))
+
+    time_df <- data.frame(
+      name     = rep(seasonal_complete$name, 2),
+      layer    = rep(seasonal_complete$layer, 2),
+      value    = c(lst_norm, ndvi_norm),
+      variable = rep(c("LST (normalized)",
+                       "NDVI (normalized)"),
+                     each = nrow(seasonal_complete))
+    )
+
+    p3 <- ggplot2::ggplot(
+      time_df,
+      ggplot2::aes(x     = reorder(name, layer),
+                   y     = value,
+                   color = variable,
+                   group = variable)
+    ) +
+      ggplot2::geom_line(linewidth = 1.2) +
+      ggplot2::geom_point(size = 3) +
+      ggplot2::scale_color_manual(
+        values = c("LST (normalized)"  = "#D73027",
+                   "NDVI (normalized)" = "#1A9850"),
+        name   = "Variable"
+      ) +
+      ggplot2::theme_minimal() +
+      ggplot2::labs(
+        title    = "Seasonal Dynamics — LST vs NDVI",
+        subtitle = "Normalized values for comparison",
+        x        = "Month",
+        y        = "Normalized Value (0-1)"
+      )
+
+    print(p3)
+  }
+
+  # ============================================================
+  # BLOC 7 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("      LST vs NDVI Analysis Complete!")
+  message("========================================")
+  message("  Overall correlation : ", overall_corr)
+  message("  p-value             : ", overall_p)
+  message("  Significant         : ", overall_p < 0.05)
+
+  if (nrow(seasonal_complete) > 0) {
+    max_corr_row <- seasonal_complete[
+      which.max(abs(seasonal_complete$correlation)), ]
+    message("  Strongest monthly r : ",
+            max_corr_row$correlation,
+            " (", max_corr_row$name, ")")
+  }
+
+  message("========================================")
+
+  return(list(
+    correlation  = list(r = overall_corr, p = overall_p),
+    seasonal     = seasonal_df,
+    scatter_data = scatter_df
+  ))
+}

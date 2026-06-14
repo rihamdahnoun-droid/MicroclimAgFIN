@@ -1,0 +1,319 @@
+#' Model Temperature Relationships
+#'
+#' @description
+#' Models the relationships between Land Surface Temperature (LST) and
+#' explanatory variables (NDVI, elevation, land cover) using linear regression.
+#' Provides variable importance, model diagnostics, and spatial predictions.
+#'
+#' @param features Data frame. Microclimate features from extract_microclimate_features().
+#' @param target Character. Target variable name. Default is "lst_mean".
+#' @param predictors Character vector. Predictor variable names.
+#'                   Default is c("ndvi_mean", "elevation").
+#' @param output_dir Character. Directory to save results. Default is "outputs/tables".
+#' @param save Logical. Whether to save results. Default is TRUE.
+#'
+#' @return A list containing:
+#' \describe{
+#'   \item{model}{Linear model object}
+#'   \item{summary}{Model summary}
+#'   \item{importance}{Variable importance data frame}
+#'   \item{predictions}{Data frame with observed vs predicted values}
+#'   \item{metrics}{Model performance metrics (R2, RMSE, MAE)}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' model_results <- model_temperature_relationships(
+#'   features   = features,
+#'   target     = "lst_mean",
+#'   predictors = c("ndvi_mean", "elevation")
+#' )
+#' }
+#'
+#' @importFrom stats lm predict residuals cor sd as.formula coef
+#' @importFrom ggplot2 ggplot aes geom_point geom_abline geom_bar geom_hline theme_minimal labs scale_fill_gradient2 coord_flip geom_smooth
+#' @export
+model_temperature_relationships <- function(features,
+                                            target     = "lst_mean",
+                                            predictors = c("ndvi_mean",
+                                                           "elevation"),
+                                            output_dir = "outputs/tables",
+                                            save       = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(features, "data.frame")) {
+    stop("features must be a data frame.")
+  }
+
+  if (!target %in% names(features)) {
+    stop("Target variable '", target, "' not found in features.\n",
+         "Available variables: ", paste(names(features), collapse = ", "))
+  }
+
+  # Garder seulement les predicteurs disponibles
+  available_preds <- predictors[predictors %in% names(features)]
+  missing_preds   <- predictors[!predictors %in% names(features)]
+
+  if (length(missing_preds) > 0) {
+    message("Predictors not found (ignored): ",
+            paste(missing_preds, collapse = ", "))
+  }
+
+  if (length(available_preds) == 0) {
+    stop("No valid predictors found.")
+  }
+
+  message("========================================")
+  message("  microclimAg — Temperature Modelling  ")
+  message("========================================\n")
+  message("Target     : ", target)
+  message("Predictors : ", paste(available_preds, collapse = ", "))
+
+  # ============================================================
+  # BLOC 2 — Préparer les données
+  # ============================================================
+
+  message("\nPreparing modelling data...")
+
+  model_vars <- c(target, available_preds)
+  model_data <- features[, model_vars]
+  model_data <- model_data[complete.cases(model_data), ]
+
+  message("  Total pixels   : ", nrow(features))
+  message("  Complete cases : ", nrow(model_data))
+
+  # ============================================================
+  # BLOC 3 — Ajuster le modèle linéaire
+  # ============================================================
+
+  message("\nFitting linear regression model...")
+
+  formula_str <- paste(target, "~", paste(available_preds, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+
+  model         <- lm(formula_obj, data = model_data)
+  model_summary <- summary(model)
+
+  message("  Formula : ", formula_str)
+  message("  R²      : ", round(model_summary$r.squared,     4))
+  message("  Adj. R² : ", round(model_summary$adj.r.squared, 4))
+  message("  F-stat  : ", round(model_summary$fstatistic[1], 2))
+
+  # ============================================================
+  # BLOC 4 — Performance du modèle
+  # ============================================================
+
+  message("\nCalculating model performance metrics...")
+
+  predicted <- predict(model, model_data)
+  observed  <- model_data[[target]]
+  residuals <- observed - predicted
+
+  r2   <- round(model_summary$r.squared,       4)
+  rmse <- round(sqrt(mean(residuals^2)),        4)
+  mae  <- round(mean(abs(residuals)),           4)
+  bias <- round(mean(residuals),                4)
+
+  metrics_df <- data.frame(
+    metric = c("R_squared", "Adj_R_squared", "RMSE", "MAE", "Bias"),
+    value  = c(r2,
+               round(model_summary$adj.r.squared, 4),
+               rmse, mae, bias)
+  )
+
+  message("  R²   : ", r2)
+  message("  RMSE : ", rmse, " C")
+  message("  MAE  : ", mae,  " C")
+  message("  Bias : ", bias, " C")
+
+  # ============================================================
+  # BLOC 5 — Importance des variables
+  # ============================================================
+
+  message("\nCalculating variable importance...")
+
+  importance_list <- lapply(available_preds, function(var) {
+
+    sd_x     <- sd(model_data[[var]],    na.rm = TRUE)
+    sd_y     <- sd(model_data[[target]], na.rm = TRUE)
+    beta     <- coef(model)[var]
+    std_beta <- beta * (sd_x / sd_y)
+    corr     <- cor(model_data[[var]], model_data[[target]],
+                    use = "complete.obs")
+
+    # Récupérer p-value de façon robuste
+    coef_names <- rownames(model_summary$coefficients)
+    p_val <- if (var %in% coef_names) {
+      model_summary$coefficients[var, "Pr(>|t|)"]
+    } else {
+      NA
+    }
+
+    data.frame(
+      variable    = var,
+      coefficient = round(beta,     4),
+      std_beta    = round(std_beta, 4),
+      correlation = round(corr,     4),
+      p_value     = round(p_val,    6),
+      significant = ifelse(is.na(p_val), FALSE, p_val < 0.05)
+    )
+  })
+
+  importance_df <- do.call(rbind, importance_list)
+  importance_df <- importance_df[order(abs(importance_df$std_beta),
+                                       decreasing = TRUE), ]
+
+  message("\nVariable Importance:")
+  print(importance_df)
+
+  # ============================================================
+  # BLOC 6 — Données observed vs predicted
+  # ============================================================
+
+  pred_df <- data.frame(
+    x         = features$x[complete.cases(features[, model_vars])],
+    y         = features$y[complete.cases(features[, model_vars])],
+    observed  = observed,
+    predicted = predicted,
+    residual  = residuals
+  )
+
+  # ============================================================
+  # BLOC 7 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    write.csv(importance_df,
+              file.path(output_dir, "variable_importance.csv"),
+              row.names = FALSE)
+
+    write.csv(metrics_df,
+              file.path(output_dir, "model_metrics.csv"),
+              row.names = FALSE)
+
+    write.csv(pred_df,
+              file.path(output_dir, "observed_vs_predicted.csv"),
+              row.names = FALSE)
+
+    message("\nResults saved to: ", output_dir)
+  }
+
+  # ============================================================
+  # BLOC 8 — Visualisations
+  # ============================================================
+
+  message("\nPlotting model diagnostics...")
+
+  # 1. Observed vs Predicted
+  p1 <- ggplot2::ggplot(pred_df,
+                        ggplot2::aes(x = observed, y = predicted)) +
+    ggplot2::geom_point(alpha = 0.3, color = "steelblue", size = 0.8) +
+    ggplot2::geom_abline(slope     = 1,
+                         intercept = 0,
+                         color     = "red",
+                         linetype  = "dashed") +
+    ggplot2::geom_smooth(method = "lm", se = TRUE, color = "black") +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title    = "Observed vs Predicted LST",
+      subtitle = paste("R² =", r2, "| RMSE =", rmse, "C"),
+      x = "Observed LST (C)",
+      y = "Predicted LST (C)"
+    )
+
+  print(p1)
+
+  # 2. Résidus
+  p2 <- ggplot2::ggplot(pred_df,
+                        ggplot2::aes(x = predicted, y = residual)) +
+    ggplot2::geom_point(alpha = 0.3, color = "tomato", size = 0.8) +
+    ggplot2::geom_hline(yintercept = 0,
+                        linetype   = "dashed",
+                        color      = "black") +
+    ggplot2::geom_smooth(method = "loess", se = FALSE, color = "blue") +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = "Residuals vs Fitted",
+      x     = "Predicted LST (C)",
+      y     = "Residuals (C)"
+    )
+
+  print(p2)
+
+  # 3. Importance des variables
+  p3 <- ggplot2::ggplot(
+    importance_df,
+    ggplot2::aes(x    = reorder(variable, abs(std_beta)),
+                 y    = std_beta,
+                 fill = std_beta)) +
+    ggplot2::geom_bar(stat = "identity") +
+    ggplot2::scale_fill_gradient2(
+      low      = "#4575B4",
+      mid      = "white",
+      high     = "#D73027",
+      midpoint = 0,
+      guide    = "none"
+    ) +
+    ggplot2::coord_flip() +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = "Variable Importance (Standardized Beta)",
+      x     = "Variable",
+      y     = "Standardized Beta Coefficient"
+    )
+
+  print(p3)
+
+  # 4. Corrélations
+  p4 <- ggplot2::ggplot(
+    importance_df,
+    ggplot2::aes(x    = reorder(variable, abs(correlation)),
+                 y    = correlation,
+                 fill = correlation)) +
+    ggplot2::geom_bar(stat = "identity") +
+    ggplot2::scale_fill_gradient2(
+      low      = "#4575B4",
+      mid      = "white",
+      high     = "#D73027",
+      midpoint = 0,
+      guide    = "none"
+    ) +
+    ggplot2::coord_flip() +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = "Correlation with LST",
+      x     = "Variable",
+      y     = "Pearson Correlation"
+    )
+
+  print(p4)
+
+  # ============================================================
+  # BLOC 9 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("      Temperature Modelling Complete!")
+  message("========================================")
+  message("  Formula : ", formula_str)
+  message("  R²      : ", r2)
+  message("  RMSE    : ", rmse, " C")
+  message("  MAE     : ", mae,  " C")
+  message("  Most important variable: ",
+          importance_df$variable[1], " (beta=",
+          importance_df$std_beta[1], ")")
+  message("========================================")
+
+  return(list(
+    model       = model,
+    summary     = model_summary,
+    importance  = importance_df,
+    predictions = pred_df,
+    metrics     = metrics_df
+  ))
+}

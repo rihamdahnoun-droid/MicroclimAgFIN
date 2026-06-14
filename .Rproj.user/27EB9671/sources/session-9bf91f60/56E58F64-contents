@@ -1,0 +1,277 @@
+#' Download Land Surface Temperature Data
+#'
+#' @description
+#' Downloads Land Surface Temperature (LST) data for a given country, region,
+#' year and months. Uses WorldClim as climatological baseline and Open-Meteo API
+#' for year-specific temperature data. The user is prompted interactively if
+#' no parameters are provided.
+#'
+#' @param country Character. ISO3 country code (e.g. "MAR"). If NULL, user is prompted.
+#' @param region Character. Region name to clip data. If NULL, user is prompted.
+#' @param year Numeric. Year of interest (e.g. 2020). If NULL, user is prompted.
+#' @param month Numeric vector. Months to download (1-12). If NULL, user is prompted.
+#' @param output_dir Character. Directory to save files. Default is "outputs/maps".
+#' @param overwrite Logical. Overwrite existing files. Default is FALSE.
+#'
+#' @return A SpatRaster object with one layer per month of LST data in Celsius.
+#'
+#' @examples
+#' \dontrun{
+#' # Interactive mode
+#' lst <- download_lst_data()
+#'
+#' # Direct mode
+#' lst <- download_lst_data(
+#'   country = "MAR",
+#'   region  = "Souss-Massa",
+#'   year    = 2022,
+#'   month   = c(6, 7, 8)
+#' )
+#' }
+#'
+#' @importFrom terra rast crop mask writeRaster nlyr values ext crs resample
+#' @importFrom geodata worldclim_country gadm
+#' @importFrom httr GET content status_code
+#' @importFrom jsonlite fromJSON
+#' @export
+download_lst_data <- function(country    = NULL,
+                              region     = NULL,
+                              year       = NULL,
+                              month      = NULL,
+                              output_dir = "outputs/maps",
+                              overwrite  = FALSE) {
+
+  month_names <- c("Jan","Feb","Mar","Apr","May","Jun",
+                   "Jul","Aug","Sep","Oct","Nov","Dec")
+
+  # ============================================================
+  # BLOC 1 — Mode interactif
+  # ============================================================
+
+  message("========================================")
+  message("   microclimAg — LST Download Wizard   ")
+  message("========================================\n")
+
+  # -- Pays --
+  if (is.null(country)) {
+    message("Common ISO3 codes:")
+    message("  MAR = Morocco  |  FRA = France  |  ESP = Spain")
+    message("  DZA = Algeria  |  TUN = Tunisia |  EGY = Egypt\n")
+    country <- readline(prompt = "Enter country ISO3 code (e.g. MAR): ")
+    country <- toupper(trimws(country))
+    if (nchar(country) != 3) stop("Invalid ISO3 code. Must be exactly 3 letters.")
+  }
+
+  # -- Région --
+  if (is.null(region)) {
+    message("\nFetching available regions for: ", country, "...")
+    boundaries_all <- geodata::gadm(country = country, level = 1, path = tempdir())
+    available_regions <- sort(boundaries_all$NAME_1)
+
+    message("\nAvailable regions:")
+    for (i in seq_along(available_regions)) {
+      message("  ", i, ". ", available_regions[i])
+    }
+    message("  0. Entire country\n")
+
+    region_input <- trimws(readline(prompt = "Enter region number or name (0 = entire country): "))
+
+    if (grepl("^[0-9]+$", region_input)) {
+      num <- as.integer(region_input)
+      if (num == 0) {
+        region <- NULL
+        message("Selected: Entire country")
+      } else if (num >= 1 && num <= length(available_regions)) {
+        region <- available_regions[num]
+        message("Selected: ", region)
+      } else {
+        stop("Invalid number.")
+      }
+    } else {
+      region <- region_input
+      message("Selected: ", region)
+    }
+  }
+
+  # -- Année --
+  if (is.null(year)) {
+    message("\nYear selection:")
+    message("  Available range: 1950 to ", format(Sys.Date(), "%Y"))
+    message("  Note: Years before 1970 use climatological estimates.\n")
+    year_input <- trimws(readline(prompt = "Enter year (e.g. 2022): "))
+    year <- as.integer(year_input)
+
+    current_year <- as.integer(format(Sys.Date(), "%Y"))
+    if (is.na(year) || year < 1950 || year > current_year) {
+      stop("Invalid year. Must be between 1950 and ", current_year, ".")
+    }
+    message("Selected year: ", year)
+  }
+
+  # -- Mois --
+  if (is.null(month)) {
+    message("\nMonth selection:")
+    message("  1=Jan  2=Feb  3=Mar  4=Apr  5=May  6=Jun")
+    message("  7=Jul  8=Aug  9=Sep  10=Oct 11=Nov 12=Dec")
+    message("  Enter months separated by commas (e.g. 6,7,8)")
+    message("  Or a range (e.g. 1:12 for full year)\n")
+
+    month_input <- trimws(readline(prompt = "Enter months: "))
+
+    if (grepl(":", month_input)) {
+      parts <- as.integer(strsplit(month_input, ":")[[1]])
+      month <- parts[1]:parts[2]
+    } else {
+      month <- as.integer(strsplit(month_input, ",")[[1]])
+    }
+
+    if (!all(month %in% 1:12)) stop("Invalid month values. Must be between 1 and 12.")
+    message("Selected months: ", paste(month_names[month], collapse = ", "))
+  }
+
+  # ============================================================
+  # BLOC 2 — Téléchargement des frontières
+  # ============================================================
+
+  message("\nDownloading boundaries...")
+
+  if (!is.null(region)) {
+    boundaries_all <- geodata::gadm(country = country, level = 1, path = tempdir())
+    region_match   <- boundaries_all$NAME_1 == region
+    if (!any(region_match)) stop("Region '", region, "' not found.")
+    boundaries <- boundaries_all[region_match, ]
+  } else {
+    boundaries <- geodata::gadm(country = country, level = 0, path = tempdir())
+  }
+
+  # Obtenir le centroïde pour Open-Meteo
+  bbox     <- terra::ext(boundaries)
+  center_lon <- (bbox$xmin + bbox$xmax) / 2
+  center_lat <- (bbox$ymin + bbox$ymax) / 2
+
+  # ============================================================
+  # BLOC 3 — Téléchargement WorldClim (base climatologique)
+  # ============================================================
+
+  message("Downloading WorldClim climatological baseline...")
+
+  lst_worldclim <- geodata::worldclim_country(
+    country = country,
+    var     = "tmax",
+    path    = tempdir(),
+    version = "2.1"
+  )
+
+  lst_base    <- lst_worldclim[[month]]
+  names(lst_base) <- month_names[month]
+
+  lst_cropped <- terra::crop(lst_base, boundaries)
+  lst_masked  <- terra::mask(lst_cropped, boundaries)
+
+  # ============================================================
+  # BLOC 4 — Ajustement par année via Open-Meteo
+  # ============================================================
+
+  message("Fetching year-specific temperature data from Open-Meteo for ", year, "...")
+
+  monthly_temps <- numeric(length(month))
+
+  for (i in seq_along(month)) {
+    m <- month[i]
+
+    # Dates début/fin du mois
+    date_start <- sprintf("%d-%02d-01", year, m)
+    last_day   <- as.character(
+      as.Date(sprintf("%d-%02d-01", year + (m == 12), m %% 12 + 1)) - 1
+    )
+
+    # Appel API Open-Meteo
+    url <- paste0(
+      "https://archive-api.open-meteo.com/v1/archive?",
+      "latitude=", round(center_lat, 4),
+      "&longitude=", round(center_lon, 4),
+      "&start_date=", date_start,
+      "&end_date=", last_day,
+      "&daily=temperature_2m_max",
+      "&timezone=auto"
+    )
+
+    tryCatch({
+      resp <- httr::GET(url)
+      if (httr::status_code(resp) == 200) {
+        data       <- jsonlite::fromJSON(httr::content(resp, "text", encoding = "UTF-8"))
+        temps      <- data$daily$temperature_2m_max
+        monthly_temps[i] <- mean(temps, na.rm = TRUE)
+        message("  ", month_names[m], " ", year, ": ",
+                round(monthly_temps[i], 1), "C (from Open-Meteo)")
+      } else {
+        monthly_temps[i] <- NA
+        message("  ", month_names[m], ": API error, using WorldClim value")
+      }
+    }, error = function(e) {
+      monthly_temps[i] <<- NA
+      message("  ", month_names[m], ": Connection error, using WorldClim value")
+    })
+  }
+
+  # ============================================================
+  # BLOC 5 — Calcul de l'anomalie et ajustement du raster
+  # ============================================================
+
+  message("\nAdjusting LST raster for year ", year, "...")
+
+  worldclim_means <- sapply(seq_along(month), function(i) {
+    mean(terra::values(lst_masked[[i]]), na.rm = TRUE)
+  })
+
+  lst_adjusted <- lst_masked
+
+  for (i in seq_along(month)) {
+    if (!is.na(monthly_temps[i])) {
+      anomaly <- monthly_temps[i] - worldclim_means[i]
+      lst_adjusted[[i]] <- lst_masked[[i]] + anomaly
+      message("  ", month_names[month[i]], " anomaly: ",
+              round(anomaly, 2), "C applied")
+    }
+  }
+
+  names(lst_adjusted) <- paste0(month_names[month], "_", year)
+
+  # ============================================================
+  # BLOC 6 — Sauvegarde
+  # ============================================================
+
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  region_label <- ifelse(is.null(region), "full", gsub("[ /]", "_", region))
+  out_file <- file.path(
+    output_dir,
+    paste0("LST_", country, "_", region_label, "_",
+           year, "_months", paste(range(month), collapse = "-"), ".tif")
+  )
+
+  if (!file.exists(out_file) || overwrite) {
+    terra::writeRaster(lst_adjusted, out_file, overwrite = TRUE)
+  }
+
+  # ============================================================
+  # BLOC 7 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("           Download Complete!")
+  message("========================================")
+  message("  Country    : ", country)
+  message("  Region     : ", ifelse(is.null(region), "Full country", region))
+  message("  Year       : ", year)
+  message("  Months     : ", paste(month_names[month], collapse = ", "))
+  message("  Method     : WorldClim baseline + Open-Meteo anomaly for ", year)
+  message("  Layers     : ", terra::nlyr(lst_adjusted))
+  message("  Temp range : ",
+          round(min(terra::values(lst_adjusted), na.rm = TRUE), 1), "C to ",
+          round(max(terra::values(lst_adjusted), na.rm = TRUE), 1), "C")
+  message("  Saved to   : ", out_file)
+  message("========================================")
+
+  return(lst_adjusted)
+}

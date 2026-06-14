@@ -1,0 +1,337 @@
+#' Cluster Thermal Zones using K-means
+#'
+#' @description
+#' Classifies pixels into thermal zones (cool, moderate, hot) using K-means
+#' clustering on LST and optionally NDVI data. The optimal number of clusters
+#' is determined automatically via the elbow method if not specified.
+#' Works on any SpatRaster with real temperature values.
+#'
+#' @param lst SpatRaster. Cleaned LST raster from clean_lst_data().
+#' @param ndvi SpatRaster. Optional NDVI raster. If provided, NDVI is included
+#'   in clustering features. Default is NULL.
+#' @param n_clusters Integer. Number of thermal clusters. If NULL, determined
+#'   automatically (2-8) via within-cluster sum of squares. Default is NULL.
+#' @param features Character vector. Variables to use for clustering. Options:
+#'   "lst_mean", "lst_sd", "ndvi_mean". Default is c("lst_mean", "lst_sd").
+#' @param n_iter Integer. Number of K-means random starts. Default is 25.
+#' @param output_dir Character. Directory to save results. Default is "outputs/maps".
+#' @param save Logical. Whether to save outputs. Default is TRUE.
+#'
+#' @return A list containing:
+#' \describe{
+#'   \item{cluster_raster}{SpatRaster with cluster labels (1 = coolest, n = hottest)}
+#'   \item{cluster_stats}{Data frame with mean temperature per cluster}
+#'   \item{optimal_k}{Optimal number of clusters selected}
+#'   \item{kmeans_model}{The fitted kmeans object}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' lst_clean <- clean_lst_data(lst)
+#' zones <- cluster_thermal_zones(lst_clean, n_clusters = 3)
+#'
+#' # With NDVI
+#' zones <- cluster_thermal_zones(lst_clean, ndvi = ndvi_raster,
+#'                                n_clusters = 4,
+#'                                features = c("lst_mean", "lst_sd", "ndvi_mean"))
+#' }
+#'
+#' @importFrom terra nlyr values mean stdev rast cellFromXY xyFromCell ncell
+#'             writeRaster resample
+#' @export
+cluster_thermal_zones <- function(lst,
+                                  ndvi        = NULL,
+                                  n_clusters  = NULL,
+                                  features    = c("lst_mean", "lst_sd"),
+                                  n_iter      = 25,
+                                  output_dir  = "outputs/maps",
+                                  save        = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(lst, "SpatRaster")) {
+    stop("lst must be a SpatRaster object.")
+  }
+  if (!is.null(ndvi) && !inherits(ndvi, "SpatRaster")) {
+    stop("ndvi must be a SpatRaster object.")
+  }
+
+  message("========================================")
+  message("  microclimAg — Thermal Zone Clustering")
+  message("========================================\n")
+  message("LST layers : ", terra::nlyr(lst))
+  message("Features   : ", paste(features, collapse = ", "))
+
+  # ============================================================
+  # BLOC 2 — Construire la matrice de features
+  # ============================================================
+
+  message("\nPreparing clustering features...")
+
+  feature_list <- list()
+
+  # LST mean
+  if ("lst_mean" %in% features || terra::nlyr(lst) == 1) {
+    lst_mean_r      <- terra::mean(lst, na.rm = TRUE)
+    feature_list[["lst_mean"]] <- terra::values(lst_mean_r)[, 1]
+  }
+
+  # LST standard deviation (variabilité intra-pixel temporelle)
+  if ("lst_sd" %in% features && terra::nlyr(lst) > 1) {
+    lst_sd_r        <- terra::stdev(lst, na.rm = TRUE)
+    feature_list[["lst_sd"]]   <- terra::values(lst_sd_r)[, 1]
+  }
+
+  # NDVI mean
+  if (!is.null(ndvi) && "ndvi_mean" %in% features) {
+    ndvi_r <- terra::resample(ndvi, lst[[1]], method = "bilinear")
+    ndvi_mean_r <- terra::mean(ndvi_r, na.rm = TRUE)
+    feature_list[["ndvi_mean"]] <- terra::values(ndvi_mean_r)[, 1]
+  }
+
+  # Assembler la matrice
+  feature_mat <- do.call(cbind, feature_list)
+  colnames(feature_mat) <- names(feature_list)
+
+  # Masque : pixels valides dans toutes les colonnes
+  valid_mask <- apply(feature_mat, 1, function(r) all(!is.na(r)))
+  message("  Valid pixels for clustering: ", sum(valid_mask))
+
+  feature_valid <- feature_mat[valid_mask, , drop = FALSE]
+
+  # Standardisation (z-score) pour donner le même poids à chaque variable
+  feature_scaled <- scale(feature_valid)
+
+  # ============================================================
+  # BLOC 3 — Déterminer le nombre optimal de clusters (méthode coude)
+  # ============================================================
+
+  if (is.null(n_clusters)) {
+    message("\nFinding optimal number of clusters (elbow method, k = 2 to 8)...")
+
+    k_range <- 2:8
+    wss     <- numeric(length(k_range))
+
+    # Sous-échantillonnage pour la vitesse si beaucoup de pixels
+    if (nrow(feature_scaled) > 10000) {
+      set.seed(42)
+      idx_sub   <- sample(nrow(feature_scaled), 10000)
+      feat_sub  <- feature_scaled[idx_sub, , drop = FALSE]
+    } else {
+      feat_sub <- feature_scaled
+    }
+
+    for (k in k_range) {
+      km  <- kmeans(feat_sub, centers = k, nstart = 10, iter.max = 50)
+      wss[k - 1] <- km$tot.withinss
+      message("  k = ", k, " -> WSS = ", round(km$tot.withinss, 1))
+    }
+
+    # Méthode du coude : dérivée seconde
+    d1  <- diff(wss)
+    d2  <- diff(d1)
+    elbow_idx  <- which.max(abs(d2)) + 2   # +2 car on a perdu 2 indices avec 2 diffs
+    n_clusters <- k_range[elbow_idx - 1]
+
+    # Minimum de 3 clusters
+    if (n_clusters < 3) n_clusters <- 3
+
+    message("  Selected k = ", n_clusters, " (elbow method)")
+
+  } else {
+    message("  Using k = ", n_clusters, " clusters (user-defined)")
+  }
+
+  # ============================================================
+  # BLOC 4 — K-means final
+  # ============================================================
+
+  message("\nRunning K-means (k = ", n_clusters, ", nstart = ", n_iter, ")...")
+
+  set.seed(42)
+  km_model <- kmeans(
+    x        = feature_scaled,
+    centers  = n_clusters,
+    nstart   = n_iter,
+    iter.max = 100,
+    algorithm = "Hartigan-Wong"
+  )
+
+  message("  Converged in  : ", km_model$iter, " iterations")
+  message("  Total WSS     : ", round(km_model$tot.withinss, 2))
+  message("  Between-SS/Total-SS: ",
+          round(100 * km_model$betweenss / km_model$totss, 1), "%")
+
+  # ============================================================
+  # BLOC 5 — Réordonner les clusters par température croissante
+  # ============================================================
+
+  message("\nOrdering clusters from coolest to hottest...")
+
+  # Température moyenne réelle par cluster (non standardisée)
+  cluster_means_lst <- tapply(feature_valid[, "lst_mean"],
+                              km_model$cluster, mean, na.rm = TRUE)
+
+  # Ordre : 1 = le plus froid, n = le plus chaud
+  order_idx    <- order(cluster_means_lst)
+  cluster_rank <- integer(n_clusters)
+  cluster_rank[order_idx] <- seq_len(n_clusters)
+
+  cluster_labels_ordered <- cluster_rank[km_model$cluster]
+
+  # Labels texte
+  zone_labels <- character(n_clusters)
+  if (n_clusters == 3) {
+    zone_labels <- c("1" = "Cool", "2" = "Moderate", "3" = "Hot")
+  } else if (n_clusters == 2) {
+    zone_labels <- c("1" = "Cool", "2" = "Hot")
+  } else {
+    zone_labels <- setNames(
+      c("Cool", paste0("Moderate-", seq_len(n_clusters - 2)), "Hot"),
+      as.character(seq_len(n_clusters))
+    )
+  }
+
+  # ============================================================
+  # BLOC 6 — Statistiques par cluster
+  # ============================================================
+
+  message("\nCluster Statistics:")
+
+  stats_list <- lapply(seq_len(n_clusters), function(k) {
+    idx      <- cluster_labels_ordered == k
+    lst_vals <- feature_valid[idx, "lst_mean"]
+
+    row <- data.frame(
+      cluster       = k,
+      label         = zone_labels[as.character(k)],
+      n_pixels      = sum(idx),
+      pct_pixels    = round(100 * sum(idx) / length(idx), 1),
+      mean_lst      = round(mean(lst_vals, na.rm = TRUE), 2),
+      sd_lst        = round(sd(lst_vals,   na.rm = TRUE), 2),
+      min_lst       = round(min(lst_vals,  na.rm = TRUE), 2),
+      max_lst       = round(max(lst_vals,  na.rm = TRUE), 2)
+    )
+
+    if (!is.null(ndvi) && "ndvi_mean" %in% colnames(feature_valid)) {
+      row$mean_ndvi <- round(mean(feature_valid[idx, "ndvi_mean"], na.rm = TRUE), 3)
+    }
+
+    row
+  })
+
+  cluster_stats <- do.call(rbind, stats_list)
+  print(cluster_stats)
+
+  # ============================================================
+  # BLOC 7 — Créer le raster des clusters
+  # ============================================================
+
+  message("\nCreating cluster raster...")
+
+  cluster_raster         <- terra::rast(lst[[1]])
+  cluster_raster[]       <- NA
+  names(cluster_raster)  <- "thermal_zones"
+
+  # Coordonnées des pixels valides
+  coords_valid <- terra::xyFromCell(cluster_raster,
+                                    which(valid_mask))
+
+  cells <- terra::cellFromXY(cluster_raster,
+                             as.matrix(coords_valid))
+  valid_cells <- !is.na(cells)
+  cluster_raster[cells[valid_cells]] <- cluster_labels_ordered[valid_cells]
+
+  # ============================================================
+  # BLOC 8 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    terra::writeRaster(cluster_raster,
+                       file.path(output_dir, "thermal_zones.tif"),
+                       overwrite = TRUE)
+
+    tables_dir <- gsub("maps", "tables", output_dir)
+    if (!dir.exists(tables_dir)) dir.create(tables_dir, recursive = TRUE)
+    write.csv(cluster_stats,
+              file.path(tables_dir, "thermal_zones_stats.csv"),
+              row.names = FALSE)
+
+    message("\nCluster raster saved to: ", output_dir)
+  }
+
+  # ============================================================
+  # BLOC 9 — Visualisation
+  # ============================================================
+
+  message("\nPlotting thermal zones...")
+
+  # Palette de couleurs : bleu -> vert -> rouge
+  zone_palette <- colorRampPalette(
+    c("#4575B4", "#91BFDB", "#FEE090", "#FC8D59", "#D73027")
+  )(n_clusters)
+
+  old_par <- par(mfrow = c(1, 2))
+
+  # Carte des zones thermiques
+  plot(cluster_raster,
+       col    = zone_palette,
+       main   = paste0("Thermal Zones (k = ", n_clusters, ")"),
+       legend = FALSE)
+  legend("topright",
+         legend = paste(cluster_stats$cluster, "-", cluster_stats$label,
+                        paste0("(", cluster_stats$mean_lst, "°C)")),
+         fill   = zone_palette,
+         cex    = 0.65,
+         bty    = "n")
+
+  # Boxplot des températures par cluster
+  # Reconstituer les données pour le boxplot
+  bp_data <- data.frame(
+    temperature = feature_valid[, "lst_mean"],
+    cluster     = factor(
+      paste(cluster_labels_ordered,
+            zone_labels[as.character(cluster_labels_ordered)],
+            sep = " - ")
+    )
+  )
+
+  boxplot(temperature ~ cluster,
+          data     = bp_data,
+          col      = zone_palette,
+          border   = "gray30",
+          main     = "Temperature Distribution by Zone",
+          xlab     = "",
+          ylab     = "Temperature (°C)",
+          las      = 2,
+          cex.axis = 0.75)
+
+  par(old_par)
+
+  # ============================================================
+  # BLOC 10 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("    Thermal Zone Clustering Complete!")
+  message("========================================")
+  message("  Clusters   : ", n_clusters)
+  message("  Method     : K-means (Hartigan-Wong)")
+  for (i in seq_len(n_clusters)) {
+    message("  Zone ", i, " (", cluster_stats$label[i], "): ",
+            cluster_stats$pct_pixels[i], "% pixels, ",
+            "mean = ", cluster_stats$mean_lst[i], "°C")
+  }
+  message("========================================")
+
+  return(list(
+    cluster_raster = cluster_raster,
+    cluster_stats  = cluster_stats,
+    optimal_k      = n_clusters,
+    kmeans_model   = km_model
+  ))
+}

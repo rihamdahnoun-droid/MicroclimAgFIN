@@ -1,0 +1,394 @@
+#' Model Temperature Relationships with Environmental Variables
+#'
+#' @description
+#' Models the statistical relationships between land surface temperature and
+#' environmental predictors (NDVI, elevation, land cover) using ordinary
+#' least squares regression and optionally Geographically Weighted Regression (GWR).
+#' Provides variable importance, residual maps, and model diagnostics.
+#'
+#' @param features_df Data frame. Output from extract_microclimate_features().
+#'   Must contain columns: lst_mean, and at least one predictor.
+#' @param predictors Character vector. Predictor variable names to include in the model.
+#'   Default is c("ndvi_mean", "elevation", "landcover").
+#' @param target Character. Name of target variable. Default is "lst_mean".
+#' @param method Character. Modelling method: "lm" (linear regression) or
+#'   "gwr" (geographically weighted regression). Default is "lm".
+#' @param lst SpatRaster. Required for GWR and residual mapping. Default is NULL.
+#' @param scale_predictors Logical. Whether to standardize predictors. Default is TRUE.
+#' @param output_dir Character. Directory to save results. Default is "outputs/tables".
+#' @param save Logical. Whether to save outputs. Default is TRUE.
+#'
+#' @return A list containing:
+#' \describe{
+#'   \item{model}{The fitted lm or GWR model object}
+#'   \item{coefficients}{Data frame of model coefficients and significance}
+#'   \item{importance}{Data frame of variable importance (standardized coefficients)}
+#'   \item{diagnostics}{Data frame of model fit metrics (R2, RMSE, AIC)}
+#'   \item{residuals_raster}{SpatRaster of residuals (if lst provided)}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' features <- extract_microclimate_features(lst, ndvi, landcover)
+#' model    <- model_temperature_relationships(features)
+#'
+#' # With GWR
+#' model <- model_temperature_relationships(
+#'   features_df  = features,
+#'   predictors   = c("ndvi_mean", "elevation"),
+#'   method       = "gwr",
+#'   lst          = lst_clean
+#' )
+#' }
+#'
+#' @importFrom stats lm coef summary.lm residuals fitted AIC cor
+#' @importFrom terra rast cellFromXY values writeRaster
+#' @importFrom ggplot2 ggplot aes geom_bar geom_point geom_abline geom_hline
+#'             scale_fill_gradient2 coord_flip labs theme_minimal theme
+#'             element_text
+#' @export
+model_temperature_relationships <- function(features_df,
+                                            predictors       = c("ndvi_mean",
+                                                                 "elevation",
+                                                                 "landcover"),
+                                            target           = "lst_mean",
+                                            method           = "lm",
+                                            lst              = NULL,
+                                            scale_predictors = TRUE,
+                                            output_dir       = "outputs/tables",
+                                            save             = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!is.data.frame(features_df)) {
+    stop("features_df must be a data frame.")
+  }
+  if (!target %in% names(features_df)) {
+    stop("Target column '", target, "' not found in features_df.")
+  }
+  if (!method %in% c("lm", "gwr")) {
+    stop("method must be 'lm' or 'gwr'.")
+  }
+
+  # Vérifier quels prédicteurs sont disponibles
+  available_preds <- predictors[predictors %in% names(features_df)]
+  missing_preds   <- predictors[!predictors %in% names(features_df)]
+
+  if (length(missing_preds) > 0) {
+    message("Warning: Predictors not found and skipped: ",
+            paste(missing_preds, collapse = ", "))
+  }
+  if (length(available_preds) == 0) {
+    stop("No valid predictors found in features_df.")
+  }
+
+  message("========================================")
+  message("  microclimAg — Temperature Modelling  ")
+  message("========================================\n")
+  message("Method     : ", toupper(method))
+  message("Target     : ", target)
+  message("Predictors : ", paste(available_preds, collapse = ", "))
+
+  # ============================================================
+  # BLOC 2 — Préparer les données
+  # ============================================================
+
+  message("\nPreparing modelling data...")
+
+  # Sélectionner les colonnes nécessaires
+  model_cols <- c("x", "y", target, available_preds)
+  model_cols <- model_cols[model_cols %in% names(features_df)]
+
+  df_model <- features_df[, model_cols, drop = FALSE]
+
+  # Supprimer les lignes avec NA dans target ou prédicteurs
+  complete_idx <- complete.cases(df_model[, c(target, available_preds)])
+  df_model     <- df_model[complete_idx, ]
+
+  message("  Complete cases: ", nrow(df_model), " / ", nrow(features_df))
+
+  if (nrow(df_model) < 30) {
+    stop("Not enough complete cases (n = ", nrow(df_model),
+         "). Need at least 30.")
+  }
+
+  # Encoder landcover comme facteur si présent
+  if ("landcover" %in% available_preds) {
+    df_model$landcover <- as.factor(df_model$landcover)
+    message("  Land cover treated as factor (",
+            nlevels(df_model$landcover), " levels)")
+  }
+
+  # Standardisation des prédicteurs numériques
+  num_preds     <- available_preds[available_preds != "landcover"]
+  scale_centers <- NULL
+  scale_scales  <- NULL
+
+  if (scale_predictors && length(num_preds) > 0) {
+    scale_result  <- scale(df_model[, num_preds, drop = FALSE])
+    scale_centers <- attr(scale_result, "scaled:center")
+    scale_scales  <- attr(scale_result, "scaled:scale")
+    df_model[, num_preds] <- as.data.frame(scale_result)
+    message("  Predictors standardized (z-score)")
+  }
+
+  # ============================================================
+  # BLOC 3 — Régression linéaire (OLS)
+  # ============================================================
+
+  formula_str <- paste(target, "~", paste(available_preds, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+
+  message("\nFitting model: ", formula_str)
+
+  if (method == "lm" || method == "gwr") {
+
+    # Toujours ajuster OLS en premier (référence ou pour GWR bandwidth)
+    lm_model <- lm(formula_obj, data = df_model)
+    lm_summ  <- summary(lm_model)
+
+    message("\n--- OLS Results ---")
+    message("  R²        : ", round(lm_summ$r.squared,      3))
+    message("  Adj. R²   : ", round(lm_summ$adj.r.squared,  3))
+    message("  RMSE      : ", round(sqrt(mean(residuals(lm_model)^2)), 3), " °C")
+    message("  AIC       : ", round(AIC(lm_model), 1))
+    message("  F-stat    : ", round(lm_summ$fstatistic[1],  2),
+            " (p = ", format(pf(lm_summ$fstatistic[1],
+                                lm_summ$fstatistic[2],
+                                lm_summ$fstatistic[3],
+                                lower.tail = FALSE),
+                             digits = 3), ")")
+
+    # Tableau des coefficients
+    coef_mat <- lm_summ$coefficients
+    coef_df  <- data.frame(
+      variable    = rownames(coef_mat),
+      estimate    = round(coef_mat[, "Estimate"],    4),
+      std_error   = round(coef_mat[, "Std. Error"],  4),
+      t_value     = round(coef_mat[, "t value"],     3),
+      p_value     = round(coef_mat[, "Pr(>|t|)"],    4),
+      signif      = symnum(coef_mat[, "Pr(>|t|)"],
+                           cutpoints = c(0, 0.001, 0.01, 0.05, 0.1, 1),
+                           symbols   = c("***","**","*","."," ")),
+      row.names   = NULL
+    )
+
+    message("\nCoefficients:")
+    print(coef_df)
+
+    # Importance des variables (coefficients standardisés pour les numériques)
+    imp_vars   <- num_preds[num_preds %in% rownames(coef_mat)]
+    importance <- data.frame(
+      variable   = imp_vars,
+      std_coef   = abs(coef_mat[imp_vars, "Estimate"]),
+      p_value    = coef_mat[imp_vars, "Pr(>|t|)"],
+      row.names  = NULL
+    )
+    importance <- importance[order(-importance$std_coef), ]
+    importance$rank <- seq_len(nrow(importance))
+    importance$rel_importance <- round(
+      100 * importance$std_coef / sum(importance$std_coef), 1
+    )
+
+    message("\nVariable Importance:")
+    print(importance)
+
+    # Diagnostics
+    diagnostics <- data.frame(
+      metric = c("R2", "Adj_R2", "RMSE", "MAE", "AIC", "n"),
+      value  = c(
+        round(lm_summ$r.squared,     4),
+        round(lm_summ$adj.r.squared, 4),
+        round(sqrt(mean(residuals(lm_model)^2)), 4),
+        round(mean(abs(residuals(lm_model))),    4),
+        round(AIC(lm_model), 2),
+        nrow(df_model)
+      )
+    )
+
+    final_model  <- lm_model
+    method_label <- "Ordinary Least Squares (OLS)"
+  }
+
+  # ============================================================
+  # BLOC 4 — GWR (optionnel)
+  # ============================================================
+
+  gwr_model <- NULL
+
+  if (method == "gwr") {
+    message("\nFitting Geographically Weighted Regression (GWR)...")
+
+    if (!requireNamespace("spgwr", quietly = TRUE)) {
+      message("  Package 'spgwr' not installed. Falling back to OLS.")
+      message("  Install with: install.packages('spgwr')")
+    } else {
+      tryCatch({
+        sp_data <- df_model
+        sp::coordinates(sp_data) <- ~ x + y
+
+        # Bandwidth optimale (peut prendre du temps)
+        message("  Finding optimal bandwidth (cross-validation)...")
+        bw <- spgwr::gwr.sel(
+          formula = formula_obj,
+          data    = sp_data,
+          verbose = FALSE
+        )
+        message("  Optimal bandwidth: ", round(bw, 4))
+
+        gwr_model <- spgwr::gwr(
+          formula = formula_obj,
+          data    = sp_data,
+          bandwidth = bw
+        )
+
+        gwr_r2   <- 1 - sum(gwr_model$SDF$localR2) / nrow(df_model)
+        message("  GWR mean local R²: ",
+                round(mean(gwr_model$SDF$localR2, na.rm = TRUE), 3))
+
+        final_model  <- gwr_model
+        method_label <- paste0("GWR (bandwidth = ", round(bw, 4), ")")
+
+      }, error = function(e) {
+        message("  GWR failed: ", e$message, ". Using OLS results.")
+        gwr_model    <<- NULL
+        method_label <<- "OLS (GWR fallback)"
+      })
+    }
+  }
+
+  # ============================================================
+  # BLOC 5 — Raster des résidus
+  # ============================================================
+
+  residuals_raster <- NULL
+
+  if (!is.null(lst) && "x" %in% names(df_model)) {
+    message("\nCreating residuals raster...")
+
+    res_vals         <- residuals(lm_model)
+    residuals_raster <- terra::rast(lst[[1]])
+    residuals_raster[] <- NA
+    names(residuals_raster) <- "OLS_residuals"
+
+    if (all(c("x", "y") %in% names(df_model))) {
+      cells <- terra::cellFromXY(residuals_raster,
+                                 as.matrix(df_model[, c("x", "y")]))
+      valid_c <- !is.na(cells)
+      residuals_raster[cells[valid_c]] <- res_vals[valid_c]
+    }
+  }
+
+  # ============================================================
+  # BLOC 6 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    write.csv(coef_df,
+              file.path(output_dir, "model_coefficients.csv"),
+              row.names = FALSE)
+    write.csv(importance,
+              file.path(output_dir, "variable_importance.csv"),
+              row.names = FALSE)
+    write.csv(diagnostics,
+              file.path(output_dir, "model_diagnostics.csv"),
+              row.names = FALSE)
+
+    if (!is.null(residuals_raster)) {
+      maps_dir <- gsub("tables", "maps", output_dir)
+      if (!dir.exists(maps_dir)) dir.create(maps_dir, recursive = TRUE)
+      terra::writeRaster(residuals_raster,
+                         file.path(maps_dir, "model_residuals.tif"),
+                         overwrite = TRUE)
+    }
+
+    message("\nModel results saved to: ", output_dir)
+  }
+
+  # ============================================================
+  # BLOC 7 — Visualisation
+  # ============================================================
+
+  message("\nPlotting model diagnostics...")
+
+  old_par <- par(mfrow = c(2, 2))
+
+  # 1. Variable importance
+  imp_sorted <- importance[order(importance$std_coef), ]
+  barplot(
+    imp_sorted$std_coef,
+    names.arg = imp_sorted$variable,
+    horiz     = TRUE,
+    col       = ifelse(imp_sorted$p_value < 0.05, "#D73027", "#AAAAAA"),
+    main      = "Variable Importance\n(standardized coefficients)",
+    xlab      = "|Standardized coefficient|",
+    las       = 1,
+    cex.names = 0.8
+  )
+  legend("bottomright",
+         legend = c("p < 0.05", "p >= 0.05"),
+         fill   = c("#D73027", "#AAAAAA"),
+         bty    = "n", cex = 0.8)
+
+  # 2. Observed vs fitted
+  fitted_vals <- fitted(lm_model)
+  obs_vals    <- df_model[[target]]
+  plot(obs_vals, fitted_vals,
+       xlab = paste("Observed", target, "(°C)"),
+       ylab = paste("Fitted", target, "(°C)"),
+       main = paste("Observed vs Fitted\nR² =", round(lm_summ$r.squared, 3)),
+       pch  = 16, cex = 0.4, col = "#2166AC80")
+  abline(0, 1, col = "red", lwd = 2)
+
+  # 3. Residuals vs fitted
+  plot(fitted_vals, residuals(lm_model),
+       xlab = "Fitted values",
+       ylab = "Residuals (°C)",
+       main = "Residuals vs Fitted",
+       pch  = 16, cex = 0.4, col = "#4DAC2680")
+  abline(h = 0, col = "red", lwd = 2)
+
+  # 4. Q-Q plot des résidus
+  qqnorm(residuals(lm_model), main = "Q-Q Plot of Residuals",
+         pch = 16, cex = 0.4, col = "#8073AC")
+  qqline(residuals(lm_model), col = "red", lwd = 2)
+
+  par(old_par)
+
+  # Visualisation résidus spatiaux si disponible
+  if (!is.null(residuals_raster)) {
+    res_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#D73027"))(100)
+    plot(residuals_raster,
+         col  = res_colors,
+         main = "Spatial Distribution of Residuals")
+  }
+
+  # ============================================================
+  # BLOC 8 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("    Temperature Modelling Complete!")
+  message("========================================")
+  message("  Method      : ", method_label)
+  message("  R²          : ", round(lm_summ$r.squared, 3))
+  message("  Adj. R²     : ", round(lm_summ$adj.r.squared, 3))
+  message("  RMSE        : ", round(sqrt(mean(residuals(lm_model)^2)), 3), " °C")
+  message("  Top predictor: ", importance$variable[1],
+          " (", importance$rel_importance[1], "% importance)")
+  message("========================================")
+
+  return(list(
+    model            = final_model,
+    coefficients     = coef_df,
+    importance       = importance,
+    diagnostics      = diagnostics,
+    residuals_raster = residuals_raster,
+    gwr_model        = gwr_model,
+    method           = method_label
+  ))
+}

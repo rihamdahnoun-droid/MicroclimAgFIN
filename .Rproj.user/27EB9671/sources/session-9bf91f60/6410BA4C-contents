@@ -1,0 +1,201 @@
+#' Calculate LST Thermal Anomalies
+#'
+#' @description
+#' Calculates thermal anomalies from LST raster data by comparing
+#' each pixel to the seasonal mean or using z-score standardization.
+#' Identifies hot and cold zones in the landscape.
+#'
+#' @param lst SpatRaster. Cleaned LST raster from clean_lst_data().
+#' @param method Character. Anomaly method: "mean_diff" or "zscore". Default is "mean_diff".
+#' @param output_dir Character. Directory to save results. Default is "outputs/maps".
+#' @param save Logical. Whether to save the anomaly raster. Default is TRUE.
+#'
+#' @return A list containing:
+#' \describe{
+#'   \item{anomaly}{SpatRaster of thermal anomalies}
+#'   \item{hot_zones}{SpatRaster of hot zones (anomaly > +1 SD)}
+#'   \item{cold_zones}{SpatRaster of cold zones (anomaly < -1 SD)}
+#'   \item{stats}{Data frame with anomaly statistics per layer}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' lst_clean <- clean_lst_data(lst)
+#' anomalies <- calculate_lst_anomaly(lst_clean, method = "zscore")
+#' }
+#'
+#' @importFrom terra nlyr values mean stdev ifel writeRaster global
+#' @importFrom ggplot2 ggplot aes geom_histogram geom_vline labs theme_minimal
+#' @export
+calculate_lst_anomaly <- function(lst,
+                                  method     = "mean_diff",
+                                  output_dir = "outputs/maps",
+                                  save       = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(lst, "SpatRaster")) {
+    stop("Input must be a SpatRaster object.")
+  }
+
+  if (!method %in% c("mean_diff", "zscore")) {
+    stop("Method must be 'mean_diff' or 'zscore'.")
+  }
+
+  message("========================================")
+  message("   microclimAg — LST Anomaly           ")
+  message("========================================\n")
+  message("Method  : ", method)
+  message("Layers  : ", terra::nlyr(lst))
+
+  # ============================================================
+  # BLOC 2 — Calcul de la moyenne et écart-type saisonniers
+  # ============================================================
+
+  message("\nCalculating seasonal statistics...")
+
+  # Moyenne pixel par pixel sur tous les mois
+  lst_mean <- terra::mean(lst, na.rm = TRUE)
+  lst_sd   <- terra::stdev(lst, na.rm = TRUE)
+
+  message("  Seasonal mean range: ",
+          round(min(terra::values(lst_mean), na.rm = TRUE), 1), "C to ",
+          round(max(terra::values(lst_mean), na.rm = TRUE), 1), "C")
+
+  # ============================================================
+  # BLOC 3 — Calcul des anomalies
+  # ============================================================
+
+  message("\nCalculating anomalies...")
+
+  if (method == "mean_diff") {
+
+    # Différence à la moyenne saisonnière
+    anomaly <- lst - lst_mean
+    message("  Method: Difference from seasonal mean (each layer - mean)")
+
+  } else if (method == "zscore") {
+
+    # Z-score : (valeur - moyenne) / écart-type
+    anomaly <- (lst - lst_mean) / (lst_sd + 1e-10)
+    message("  Method: Z-score standardization (value - mean) / sd")
+  }
+
+  names(anomaly) <- paste0("anomaly_", names(lst))
+
+  # ============================================================
+  # BLOC 4 — Identifier zones chaudes et froides
+  # ============================================================
+
+  message("\nIdentifying hot and cold zones...")
+
+  if (method == "mean_diff") {
+    threshold <- terra::global(lst_sd, "mean", na.rm = TRUE)$mean
+    message("  Threshold (mean SD): ", round(threshold, 2), "C")
+  } else {
+    threshold <- 1.0
+    message("  Threshold: +/- 1 standard deviation")
+  }
+
+  # Zones chaudes (anomalie positive > seuil)
+  hot_zones  <- terra::ifel(anomaly >  threshold, 1, NA)
+  # Zones froides (anomalie négative < -seuil)
+  cold_zones <- terra::ifel(anomaly < -threshold, 1, NA)
+
+  names(hot_zones)  <- paste0("hot_",  names(lst))
+  names(cold_zones) <- paste0("cold_", names(lst))
+
+  # ============================================================
+  # BLOC 5 — Statistiques par couche
+  # ============================================================
+
+  message("\nComputing layer statistics...")
+
+  stats_list <- lapply(seq_len(terra::nlyr(anomaly)), function(i) {
+    vals <- terra::values(anomaly[[i]])
+    vals <- vals[!is.na(vals)]
+
+    hot_pct  <- round(100 * mean(vals >  threshold, na.rm = TRUE), 1)
+    cold_pct <- round(100 * mean(vals < -threshold, na.rm = TRUE), 1)
+
+    data.frame(
+      layer     = names(lst)[i],
+      mean_anom = round(mean(vals),   2),
+      sd_anom   = round(sd(vals),     2),
+      min_anom  = round(min(vals),    2),
+      max_anom  = round(max(vals),    2),
+      hot_pct   = hot_pct,
+      cold_pct  = cold_pct
+    )
+  })
+
+  stats_df <- do.call(rbind, stats_list)
+
+  message("\nAnomaly Statistics:")
+  print(stats_df)
+
+  # ============================================================
+  # BLOC 6 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    terra::writeRaster(anomaly,
+                       file.path(output_dir, "LST_anomaly.tif"),
+                       overwrite = TRUE)
+    terra::writeRaster(hot_zones,
+                       file.path(output_dir, "LST_hot_zones.tif"),
+                       overwrite = TRUE)
+    terra::writeRaster(cold_zones,
+                       file.path(output_dir, "LST_cold_zones.tif"),
+                       overwrite = TRUE)
+
+    write.csv(stats_df,
+              file.path("outputs/tables", "LST_anomaly_stats.csv"),
+              row.names = FALSE)
+
+    message("\nFiles saved to: ", output_dir)
+  }
+
+  # ============================================================
+  # BLOC 7 — Visualisation
+  # ============================================================
+
+  message("\nPlotting anomaly maps...")
+
+  # Palette divergente bleue-rouge
+  anomaly_colors <- colorRampPalette(c("#2166AC","#92C5DE","#F7F7F7",
+                                       "#F4A582","#D6604D","#B2182B"))(100)
+
+  old_par <- par(mfrow = c(1, min(3, terra::nlyr(anomaly))))
+
+  for (i in seq_len(min(3, terra::nlyr(anomaly)))) {
+    plot(anomaly[[i]],
+         col  = anomaly_colors,
+         main = paste("Thermal Anomaly\n", names(lst)[i]))
+  }
+
+  par(old_par)
+
+  # ============================================================
+  # BLOC 8 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("        Anomaly Calculation Complete!")
+  message("========================================")
+  message("  Method     : ", method)
+  message("  Hot zones  : avg ", mean(stats_df$hot_pct),  "% of pixels")
+  message("  Cold zones : avg ", mean(stats_df$cold_pct), "% of pixels")
+  message("========================================")
+
+  return(list(
+    anomaly    = anomaly,
+    hot_zones  = hot_zones,
+    cold_zones = cold_zones,
+    stats      = stats_df
+  ))
+}

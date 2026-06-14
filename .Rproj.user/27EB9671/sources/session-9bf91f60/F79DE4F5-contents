@@ -1,0 +1,368 @@
+#' Analyze Spatial Autocorrelation of Temperature
+#'
+#' @description
+#' Computes spatial autocorrelation statistics on LST or any temperature raster,
+#' including Moran's I (global and local), spatial lag, and cluster detection.
+#' Uses real spatial weights based on raster pixel neighborhoods.
+#'
+#' @param lst SpatRaster. LST or temperature raster (single or multi-layer).
+#'   If multi-layer, the mean layer is used.
+#' @param layer_index Integer. Layer index to analyze if lst has multiple layers.
+#'   Default is NULL (uses mean of all layers).
+#' @param method Character. Spatial weights method: "queen" (all 8 neighbors)
+#'   or "rook" (4 neighbors). Default is "queen".
+#' @param sample_size Integer. Number of pixels to sample for analysis (speeds up
+#'   computation on large rasters). Default is 5000. Use NULL for all pixels.
+#' @param output_dir Character. Directory to save results. Default is "outputs/tables".
+#' @param save Logical. Whether to save outputs. Default is TRUE.
+#'
+#' @return A list containing:
+#' \describe{
+#'   \item{moran_global}{List with Moran's I statistic, expected I, variance, p-value}
+#'   \item{local_moran}{Data frame with local Moran's I per pixel (LISA)}
+#'   \item{cluster_raster}{SpatRaster with LISA cluster types (HH/LL/HL/LH)}
+#'   \item{stats}{Summary data frame}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' lst_clean <- clean_lst_data(lst)
+#' result <- analyze_spatial_correlation(lst_clean)
+#' result <- analyze_spatial_correlation(lst_clean, layer_index = 1, method = "rook")
+#' }
+#'
+#' @importFrom terra nlyr values mean xyFromCell ncell rast cellFromXY res ext
+#' @importFrom spdep nb2listw dnearneigh moran.test localmoran
+#' @importFrom ggplot2 ggplot aes geom_raster geom_histogram scale_fill_manual
+#'             theme_minimal labs theme element_text
+#' @export
+analyze_spatial_correlation <- function(lst,
+                                        layer_index  = NULL,
+                                        method       = "queen",
+                                        sample_size  = 5000,
+                                        output_dir   = "outputs/tables",
+                                        save         = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(lst, "SpatRaster")) {
+    stop("Input must be a SpatRaster object.")
+  }
+  if (!method %in% c("queen", "rook")) {
+    stop("method must be 'queen' or 'rook'.")
+  }
+  if (!requireNamespace("spdep", quietly = TRUE)) {
+    stop("Package 'spdep' is required. Install with: install.packages('spdep')")
+  }
+
+  message("========================================")
+  message("  microclimAg — Spatial Autocorrelation")
+  message("========================================\n")
+
+  # ============================================================
+  # BLOC 2 — Préparer la couche à analyser
+  # ============================================================
+
+  if (terra::nlyr(lst) > 1) {
+    if (!is.null(layer_index)) {
+      message("Using layer: ", names(lst)[layer_index])
+      layer <- lst[[layer_index]]
+    } else {
+      message("Multi-layer raster detected. Using pixel-wise mean across all layers.")
+      layer <- terra::mean(lst, na.rm = TRUE)
+      names(layer) <- "LST_mean"
+    }
+  } else {
+    layer <- lst
+  }
+
+  message("Layer     : ", names(layer))
+  message("Method    : ", toupper(method), " contiguity weights")
+
+  # ============================================================
+  # BLOC 3 — Extraire coordonnées et valeurs
+  # ============================================================
+
+  message("\nExtracting pixel values and coordinates...")
+
+  all_vals   <- terra::values(layer)[, 1]
+  all_coords <- terra::xyFromCell(layer, 1:terra::ncell(layer))
+
+  # Supprimer les NA
+  valid_idx  <- !is.na(all_vals)
+  vals       <- all_vals[valid_idx]
+  coords     <- all_coords[valid_idx, , drop = FALSE]
+
+  message("  Valid pixels : ", length(vals))
+
+  # Echantillonnage si nécessaire
+  if (!is.null(sample_size) && length(vals) > sample_size) {
+    set.seed(42)
+    idx    <- sample(length(vals), sample_size)
+    vals   <- vals[idx]
+    coords <- coords[idx, , drop = FALSE]
+    message("  Sampled to   : ", sample_size, " pixels (for performance)")
+  }
+
+  # ============================================================
+  # BLOC 4 — Construire la matrice de voisinage
+  # ============================================================
+
+  message("\nBuilding spatial weights matrix...")
+
+  # Rayon de voisinage basé sur la résolution du raster
+  pixel_res  <- terra::res(layer)
+  # Rayon = diagonale du pixel * 1.5 pour inclure voisins Queen
+  if (method == "queen") {
+    max_dist <- sqrt(pixel_res[1]^2 + pixel_res[2]^2) * 1.5
+  } else {
+    max_dist <- max(pixel_res) * 1.2
+  }
+
+  nb <- spdep::dnearneigh(
+    x        = coords,
+    d1       = 0,
+    d2       = max_dist,
+    longlat  = TRUE
+  )
+
+  # Vérifier que tous les pixels ont au moins un voisin
+  n_no_neighbor <- sum(spdep::card(nb) == 0)
+  if (n_no_neighbor > 0) {
+    message("  Warning: ", n_no_neighbor, " pixels have no neighbors. ",
+            "Increasing distance threshold...")
+    max_dist <- max_dist * 2
+    nb <- spdep::dnearneigh(coords, d1 = 0, d2 = max_dist, longlat = TRUE)
+  }
+
+  listw <- spdep::nb2listw(nb, style = "W", zero.policy = TRUE)
+
+  message("  Neighbors   : avg ", round(mean(spdep::card(nb)), 1), " per pixel")
+  message("  Max distance: ", round(max_dist, 4), " degrees")
+
+  # ============================================================
+  # BLOC 5 — Moran's I Global
+  # ============================================================
+
+  message("\nComputing Global Moran's I...")
+
+  moran_result <- spdep::moran.test(
+    x           = vals,
+    listw       = listw,
+    zero.policy = TRUE,
+    alternative = "two.sided"
+  )
+
+  I_stat    <- round(moran_result$estimate["Moran I statistic"], 4)
+  I_exp     <- round(moran_result$estimate["Expectation"],       4)
+  I_var     <- round(moran_result$estimate["Variance"],          6)
+  p_value   <- moran_result$p.value
+
+  message("  Moran's I  : ", I_stat)
+  message("  Expected I : ", I_exp)
+  message("  p-value    : ", format(p_value, scientific = TRUE, digits = 3))
+
+  if (p_value < 0.001) {
+    sig_label <- "*** (p < 0.001)"
+  } else if (p_value < 0.01) {
+    sig_label <- "**  (p < 0.01)"
+  } else if (p_value < 0.05) {
+    sig_label <- "*   (p < 0.05)"
+  } else {
+    sig_label <- "ns  (p >= 0.05)"
+  }
+
+  if (I_stat > 0) {
+    interp <- "Positive spatial autocorrelation (hot/cold clusters exist)"
+  } else if (I_stat < 0) {
+    interp <- "Negative spatial autocorrelation (dispersed pattern)"
+  } else {
+    interp <- "No spatial autocorrelation (random pattern)"
+  }
+
+  message("  Significance: ", sig_label)
+  message("  Interpretation: ", interp)
+
+  moran_global <- list(
+    statistic   = as.numeric(I_stat),
+    expected    = as.numeric(I_exp),
+    variance    = as.numeric(I_var),
+    p_value     = p_value,
+    significant = p_value < 0.05,
+    interpretation = interp
+  )
+
+  # ============================================================
+  # BLOC 6 — LISA — Local Moran's I
+  # ============================================================
+
+  message("\nComputing Local Moran's I (LISA)...")
+
+  local_moran_raw <- spdep::localmoran(
+    x           = vals,
+    listw       = listw,
+    zero.policy = TRUE,
+    alternative = "two.sided"
+  )
+
+  local_df <- data.frame(
+    x         = coords[, 1],
+    y         = coords[, 2],
+    value     = vals,
+    local_I   = local_moran_raw[, "Ii"],
+    z_score   = local_moran_raw[, "Z.Ii"],
+    p_value   = local_moran_raw[, "Pr(z != E(Ii))"]
+  )
+
+  # Valeur standardisée pour la classification
+  val_std       <- scale(vals)[, 1]
+  lag_std       <- as.numeric(spdep::lag.listw(listw, val_std, zero.policy = TRUE))
+
+  # Classification LISA
+  sig_threshold <- 0.05
+  sig_pixels    <- local_df$p_value < sig_threshold
+
+  local_df$cluster_type <- "Not Significant"
+  local_df$cluster_type[sig_pixels & val_std >  0 & lag_std >  0] <- "HH (Hot Spot)"
+  local_df$cluster_type[sig_pixels & val_std <  0 & lag_std <  0] <- "LL (Cold Spot)"
+  local_df$cluster_type[sig_pixels & val_std >  0 & lag_std <  0] <- "HL (High-Low)"
+  local_df$cluster_type[sig_pixels & val_std <  0 & lag_std >  0] <- "LH (Low-High)"
+
+  cluster_counts <- table(local_df$cluster_type)
+  message("\nLISA Cluster Summary:")
+  for (cn in names(cluster_counts)) {
+    pct <- round(100 * cluster_counts[cn] / nrow(local_df), 1)
+    message("  ", cn, ": ", cluster_counts[cn], " pixels (", pct, "%)")
+  }
+
+  # ============================================================
+  # BLOC 7 — Créer le raster des clusters
+  # ============================================================
+
+  message("\nCreating cluster raster...")
+
+  cluster_raster <- terra::rast(layer)
+  cluster_raster[] <- NA
+
+  cluster_codes <- c(
+    "HH (Hot Spot)"    = 1,
+    "LL (Cold Spot)"   = 2,
+    "HL (High-Low)"    = 3,
+    "LH (Low-High)"    = 4,
+    "Not Significant"  = 0
+  )
+
+  local_df$cluster_code <- cluster_codes[local_df$cluster_type]
+
+  cells <- terra::cellFromXY(cluster_raster,
+                             as.matrix(local_df[, c("x", "y")]))
+  valid_cells <- !is.na(cells)
+  cluster_raster[cells[valid_cells]] <- local_df$cluster_code[valid_cells]
+  names(cluster_raster) <- "LISA_clusters"
+
+  # ============================================================
+  # BLOC 8 — Statistiques résumées
+  # ============================================================
+
+  stats_df <- data.frame(
+    metric    = c("Moran_I", "Expected_I", "Variance", "p_value",
+                  "HH_pct", "LL_pct", "HL_pct", "LH_pct", "NS_pct"),
+    value     = c(
+      as.numeric(I_stat),
+      as.numeric(I_exp),
+      as.numeric(I_var),
+      p_value,
+      round(100 * sum(local_df$cluster_type == "HH (Hot Spot)")   / nrow(local_df), 1),
+      round(100 * sum(local_df$cluster_type == "LL (Cold Spot)")  / nrow(local_df), 1),
+      round(100 * sum(local_df$cluster_type == "HL (High-Low)")   / nrow(local_df), 1),
+      round(100 * sum(local_df$cluster_type == "LH (Low-High)")   / nrow(local_df), 1),
+      round(100 * sum(local_df$cluster_type == "Not Significant") / nrow(local_df), 1)
+    )
+  )
+
+  # ============================================================
+  # BLOC 9 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    write.csv(local_df,
+              file.path(output_dir, "spatial_autocorrelation_lisa.csv"),
+              row.names = FALSE)
+    write.csv(stats_df,
+              file.path(output_dir, "spatial_autocorrelation_stats.csv"),
+              row.names = FALSE)
+
+    maps_dir <- gsub("tables", "maps", output_dir)
+    if (!dir.exists(maps_dir)) dir.create(maps_dir, recursive = TRUE)
+    terra::writeRaster(cluster_raster,
+                       file.path(maps_dir, "LISA_clusters.tif"),
+                       overwrite = TRUE)
+    message("\nResults saved to: ", output_dir)
+  }
+
+  # ============================================================
+  # BLOC 10 — Visualisation
+  # ============================================================
+
+  message("\nPlotting spatial autocorrelation results...")
+
+  cluster_colors <- c(
+    "HH (Hot Spot)"    = "#D73027",
+    "LL (Cold Spot)"   = "#4575B4",
+    "HL (High-Low)"    = "#FC8D59",
+    "LH (Low-High)"    = "#91BFDB",
+    "Not Significant"  = "#F0F0F0"
+  )
+
+  old_par <- par(mfrow = c(1, 2))
+
+  # Moran scatterplot
+  plot(val_std, lag_std,
+       xlab  = "Standardized Temperature",
+       ylab  = "Spatial Lag",
+       main  = paste0("Moran Scatterplot\nI = ", I_stat,
+                      " (p = ", format(p_value, digits = 2), ")"),
+       pch   = 16,
+       cex   = 0.4,
+       col   = ifelse(sig_pixels, "#D73027", "#AAAAAA"))
+  abline(h = 0, v = 0, lty = 2, col = "gray50")
+  abline(lm(lag_std ~ val_std), col = "blue", lwd = 2)
+
+  # LISA map
+  plot(cluster_raster,
+       col  = c("#F0F0F0", "#D73027", "#4575B4", "#FC8D59", "#91BFDB"),
+       main = "LISA Cluster Map",
+       legend = FALSE)
+  legend("topright",
+         legend = names(cluster_colors),
+         fill   = unname(cluster_colors),
+         cex    = 0.7,
+         bty    = "n")
+
+  par(old_par)
+
+  # ============================================================
+  # BLOC 11 — Résumé final
+  # ============================================================
+
+  message("\n========================================")
+  message("    Spatial Autocorrelation Complete!")
+  message("========================================")
+  message("  Global Moran's I : ", I_stat, " ", sig_label)
+  message("  Hot spots (HH)   : ",
+          round(100 * sum(local_df$cluster_type == "HH (Hot Spot)") / nrow(local_df), 1), "%")
+  message("  Cold spots (LL)  : ",
+          round(100 * sum(local_df$cluster_type == "LL (Cold Spot)") / nrow(local_df), 1), "%")
+  message("========================================")
+
+  return(list(
+    moran_global   = moran_global,
+    local_moran    = local_df,
+    cluster_raster = cluster_raster,
+    stats          = stats_df
+  ))
+}

@@ -1,0 +1,250 @@
+#' Extract Microclimate Features
+#'
+#' @description
+#' Extracts and combines microclimate variables from multiple raster layers
+#' (LST, NDVI, elevation, land cover) into a single data frame for analysis.
+#' Performs zonal extraction and spatial aggregation.
+#'
+#' @param lst SpatRaster. Cleaned LST raster from clean_lst_data().
+#' @param ndvi SpatRaster. NDVI raster from calculate_ndvi().
+#' @param landcover SpatRaster. Land cover raster from import_landcover().
+#' @param elevation SpatRaster. Elevation raster. If NULL, downloaded automatically.
+#' @param country Character. ISO3 country code (needed if elevation is NULL).
+#' @param output_dir Character. Directory to save results. Default is "outputs/tables".
+#' @param save Logical. Whether to save the data frame. Default is TRUE.
+#'
+#' @return A data frame with extracted microclimate features per pixel
+#' including coordinates (x, y), LST values per month, NDVI values per month,
+#' elevation in meters, land cover class, mean LST, and mean NDVI.
+#'
+#' @examples
+#' \dontrun{
+#' features <- extract_microclimate_features(
+#'   lst       = lst_clean,
+#'   ndvi      = ndvi,
+#'   landcover = lc,
+#'   country   = "MAR"
+#' )
+#' }
+#'
+#' @importFrom terra values xyFromCell ncell resample extract as.data.frame
+#' @importFrom geodata elevation_30s gadm
+#' @export
+extract_microclimate_features <- function(lst,
+                                          ndvi,
+                                          landcover  = NULL,
+                                          elevation  = NULL,
+                                          country    = "MAR",
+                                          output_dir = "outputs/tables",
+                                          save       = TRUE) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  if (!inherits(lst, "SpatRaster")) stop("lst must be a SpatRaster object.")
+  if (!inherits(ndvi, "SpatRaster")) stop("ndvi must be a SpatRaster object.")
+
+  message("========================================")
+  message("  microclimAg — Feature Extraction     ")
+  message("========================================\n")
+  message("LST layers  : ", terra::nlyr(lst))
+  message("NDVI layers : ", terra::nlyr(ndvi))
+
+  # ============================================================
+  # BLOC 2 — Harmoniser les résolutions
+  # ============================================================
+
+  message("\nHarmonizing raster resolutions...")
+
+  # Utiliser LST comme référence
+  reference <- lst[[1]]
+
+  # Rééchantillonner NDVI sur la grille LST
+  if (!all(terra::res(ndvi) == terra::res(lst))) {
+    message("  Resampling NDVI to match LST resolution...")
+    ndvi <- terra::resample(ndvi, reference, method = "bilinear")
+  }
+
+  # Rééchantillonner land cover si fourni
+  if (!is.null(landcover)) {
+    if (!all(terra::res(landcover) == terra::res(lst))) {
+      message("  Resampling land cover to match LST resolution...")
+      landcover <- terra::resample(landcover, reference, method = "near")
+    }
+  }
+
+  # ============================================================
+  # BLOC 3 — Télécharger l'élévation si manquante
+  # ============================================================
+
+  if (is.null(elevation)) {
+    message("\nDownloading elevation data for: ", country, "...")
+    elevation <- geodata::elevation_30s(country = country, path = tempdir())
+    elevation <- terra::crop(elevation, terra::ext(lst))
+    elevation <- terra::mask(elevation, lst[[1]] * 0 + 1)
+    elevation <- terra::resample(elevation, reference, method = "bilinear")
+    message("  Elevation downloaded and resampled.")
+  } else {
+    if (!all(terra::res(elevation) == terra::res(lst))) {
+      message("  Resampling elevation to match LST resolution...")
+      elevation <- terra::resample(elevation, reference, method = "bilinear")
+    }
+  }
+
+  # ============================================================
+  # BLOC 4 — Extraire les coordonnées
+  # ============================================================
+
+  message("\nExtracting pixel coordinates...")
+
+  coords <- terra::xyFromCell(reference, 1:terra::ncell(reference))
+  df     <- data.frame(x = coords[, 1], y = coords[, 2])
+
+  # ============================================================
+  # BLOC 5 — Extraire les valeurs LST
+  # ============================================================
+
+  message("Extracting LST values...")
+
+  lst_df <- as.data.frame(terra::values(lst))
+  colnames(lst_df) <- paste0("lst_", names(lst))
+  df <- cbind(df, lst_df)
+
+  # Moyenne LST
+  df$lst_mean <- rowMeans(lst_df, na.rm = TRUE)
+  df$lst_sd   <- apply(lst_df, 1, sd, na.rm = TRUE)
+
+  message("  LST columns added: ", paste(colnames(lst_df), collapse = ", "))
+
+  # ============================================================
+  # BLOC 6 — Extraire les valeurs NDVI
+  # ============================================================
+
+  message("Extracting NDVI values...")
+
+  ndvi_df <- as.data.frame(terra::values(ndvi))
+  colnames(ndvi_df) <- paste0("ndvi_", names(ndvi))
+  df <- cbind(df, ndvi_df)
+
+  # Moyenne NDVI
+  df$ndvi_mean <- rowMeans(ndvi_df, na.rm = TRUE)
+  df$ndvi_sd   <- apply(ndvi_df, 1, sd, na.rm = TRUE)
+
+  message("  NDVI columns added: ", paste(colnames(ndvi_df), collapse = ", "))
+
+  # ============================================================
+  # BLOC 7 — Extraire l'élévation
+  # ============================================================
+
+  message("Extracting elevation values...")
+
+  df$elevation <- terra::values(elevation)[, 1]
+  message("  Elevation range: ",
+          round(min(df$elevation, na.rm = TRUE), 0), "m to ",
+          round(max(df$elevation, na.rm = TRUE), 0), "m")
+
+  # ============================================================
+  # BLOC 8 — Extraire le land cover
+  # ============================================================
+
+  if (!is.null(landcover)) {
+    message("Extracting land cover values...")
+    df$landcover <- terra::values(landcover)[, 1]
+
+    # Labels land cover
+    lc_labels <- c("1" = "Cropland",
+                   "2" = "Forest",
+                   "3" = "Shrubland",
+                   "4" = "Bare Soil",
+                   "5" = "Urban",
+                   "6" = "Water",
+                   "7" = "Other")
+
+    df$landcover_label <- lc_labels[as.character(df$landcover)]
+    message("  Land cover classes: ",
+            paste(unique(df$landcover_label[!is.na(df$landcover_label)]),
+                  collapse = ", "))
+  }
+
+  # ============================================================
+  # BLOC 9 — Supprimer les lignes avec trop de NA
+  # ============================================================
+
+  message("\nRemoving rows with missing LST or NDVI...")
+
+  n_before <- nrow(df)
+  df       <- df[!is.na(df$lst_mean) & !is.na(df$ndvi_mean), ]
+  n_after  <- nrow(df)
+
+  message("  Rows removed: ", n_before - n_after)
+  message("  Rows kept   : ", n_after)
+
+  # ============================================================
+  # BLOC 10 — Statistiques résumées
+  # ============================================================
+
+  message("\nFeature Summary:")
+  message("  Total pixels   : ", nrow(df))
+  message("  Mean LST       : ", round(mean(df$lst_mean,  na.rm = TRUE), 2), " C")
+  message("  Mean NDVI      : ", round(mean(df$ndvi_mean, na.rm = TRUE), 3))
+  message("  Mean Elevation : ", round(mean(df$elevation, na.rm = TRUE), 0), " m")
+  message("  Variables      : ", ncol(df))
+
+  # ============================================================
+  # BLOC 11 — Sauvegarde
+  # ============================================================
+
+  if (save) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+    out_file <- file.path(output_dir, "microclimate_features.csv")
+    write.csv(df, out_file, row.names = FALSE)
+    message("\nFeatures saved to: ", out_file)
+  }
+
+  # ============================================================
+  # BLOC 12 — Visualisation
+  # ============================================================
+
+  message("\nPlotting feature distributions...")
+
+  old_par <- par(mfrow = c(2, 2))
+
+  hist(df$lst_mean,
+       main   = "LST Distribution",
+       xlab   = "Temperature (C)",
+       col    = "tomato",
+       border = "white")
+
+  hist(df$ndvi_mean,
+       main   = "NDVI Distribution",
+       xlab   = "NDVI",
+       col    = "forestgreen",
+       border = "white")
+
+  hist(df$elevation,
+       main   = "Elevation Distribution",
+       xlab   = "Elevation (m)",
+       col    = "steelblue",
+       border = "white")
+
+  if (!is.null(landcover) && "landcover_label" %in% names(df)) {
+    lc_counts <- table(df$landcover_label)
+    barplot(lc_counts,
+            main   = "Land Cover Classes",
+            col    = c("#FFD700","#228B22","#90EE90",
+                       "#D2B48C","#FF4500","#4169E1","#808080"),
+            border = "white",
+            las    = 2,
+            cex.names = 0.7)
+  }
+
+  par(old_par)
+
+  message("\n========================================")
+  message("      Feature Extraction Complete!")
+  message("========================================")
+
+  return(df)
+}

@@ -1,0 +1,392 @@
+#' Plot Microclimate Maps
+#'
+#' @description
+#' Creates publication-ready microclimate maps from LST, NDVI, thermal
+#' anomalies, and heat island data. Supports export to PNG or PDF and
+#' multi-date faceting.
+#'
+#' @param lst SpatRaster. LST raster from clean_lst_data(). Default is NULL.
+#' @param ndvi SpatRaster. NDVI raster from calculate_ndvi(). Default is NULL.
+#' @param anomaly SpatRaster. Anomaly raster from calculate_lst_anomaly(). Default is NULL.
+#' @param hot_zones SpatRaster. Hot zones raster from calculate_lst_anomaly(). Default is NULL.
+#' @param thermal_zones SpatRaster. Thermal zones from cluster_thermal_zones(). Default is NULL.
+#' @param map_type Character. Type of map to produce:
+#'   "lst", "ndvi", "anomaly", "hot_zones", "thermal_zones", or "all".
+#'   Default is "all".
+#' @param title Character. Main title for the map. Default is "Microclimate Analysis".
+#' @param output_dir Character. Directory to save maps. Default is "outputs/maps".
+#' @param export Character. Export format: "png", "pdf", or "none". Default is "png".
+#' @param width Numeric. Width of exported figure in inches. Default is 10.
+#' @param height Numeric. Height of exported figure in inches. Default is 8.
+#'
+#' @return Invisibly returns a list of ggplot objects.
+#'
+#' @examples
+#' \dontrun{
+#' plot_microclimate_map(
+#'   lst        = lst_clean,
+#'   ndvi       = ndvi,
+#'   anomaly    = anomalies$anomaly,
+#'   hot_zones  = anomalies$hot_zones,
+#'   map_type   = "all",
+#'   export     = "png"
+#' )
+#' }
+#'
+#' @importFrom terra as.data.frame values
+#' @importFrom ggplot2 ggplot aes geom_raster scale_fill_gradientn
+#'             scale_fill_manual theme_minimal theme labs
+#'             element_text element_blank margin
+#' @importFrom grDevices png pdf dev.off heat.colors colorRampPalette
+#' @export
+plot_microclimate_map <- function(lst           = NULL,
+                                  ndvi          = NULL,
+                                  anomaly       = NULL,
+                                  hot_zones     = NULL,
+                                  thermal_zones = NULL,
+                                  map_type      = "all",
+                                  title         = "Microclimate Analysis",
+                                  output_dir    = "outputs/maps",
+                                  export        = "png",
+                                  width         = 10,
+                                  height        = 8) {
+
+  # ============================================================
+  # BLOC 1 — Vérifications
+  # ============================================================
+
+  valid_types <- c("lst", "ndvi", "anomaly", "hot_zones",
+                   "thermal_zones", "all")
+  if (!map_type %in% valid_types) {
+    stop("map_type must be one of: ", paste(valid_types, collapse = ", "))
+  }
+
+  message("========================================")
+  message("  microclimAg — Microclimate Mapping   ")
+  message("========================================\n")
+  message("Map type : ", map_type)
+  message("Export   : ", export)
+
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  plots <- list()
+
+  # ============================================================
+  # BLOC 2 — Fonction utilitaire pour convertir raster en df
+  # ============================================================
+
+  raster_to_df <- function(r, value_name = "value") {
+    df        <- as.data.frame(r, xy = TRUE)
+    names(df) <- c("x", "y", value_name)
+    df        <- df[!is.na(df[[value_name]]), ]
+    df
+  }
+
+  # ============================================================
+  # BLOC 3 — Carte LST
+  # ============================================================
+
+  make_lst_map <- function() {
+    if (is.null(lst)) {
+      message("  LST raster not provided. Skipping.")
+      return(NULL)
+    }
+
+    message("  Creating LST map...")
+    df <- raster_to_df(lst[[1]], "lst")
+
+    p <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y, fill = lst)) +
+      ggplot2::geom_raster() +
+      ggplot2::scale_fill_gradientn(
+        colors = rev(heat.colors(100)),
+        name   = "LST (°C)"
+      ) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(size = 14, face = "bold"),
+        plot.subtitle = ggplot2::element_text(size = 10, color = "gray50"),
+        axis.title    = ggplot2::element_text(size = 9),
+        legend.title  = ggplot2::element_text(size = 9)
+      ) +
+      ggplot2::labs(
+        title    = "Land Surface Temperature (LST)",
+        subtitle = paste("Layer:", names(lst)[1]),
+        x        = "Longitude",
+        y        = "Latitude"
+      )
+
+    print(p)
+    p
+  }
+
+  # ============================================================
+  # BLOC 4 — Carte NDVI
+  # ============================================================
+
+  make_ndvi_map <- function() {
+    if (is.null(ndvi)) {
+      message("  NDVI raster not provided. Skipping.")
+      return(NULL)
+    }
+
+    message("  Creating NDVI map...")
+    df <- raster_to_df(ndvi[[1]], "ndvi")
+
+    ndvi_colors <- colorRampPalette(c(
+      "#8B4513", "#D2B48C", "#FFFF00",
+      "#90EE90", "#228B22", "#006400"
+    ))(100)
+
+    p <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y, fill = ndvi)) +
+      ggplot2::geom_raster() +
+      ggplot2::scale_fill_gradientn(
+        colors = ndvi_colors,
+        limits = c(-1, 1),
+        name   = "NDVI"
+      ) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(size = 14, face = "bold"),
+        plot.subtitle = ggplot2::element_text(size = 10, color = "gray50"),
+        axis.title    = ggplot2::element_text(size = 9),
+        legend.title  = ggplot2::element_text(size = 9)
+      ) +
+      ggplot2::labs(
+        title    = "Normalized Difference Vegetation Index (NDVI)",
+        subtitle = paste("Layer:", names(ndvi)[1]),
+        x        = "Longitude",
+        y        = "Latitude"
+      )
+
+    print(p)
+    p
+  }
+
+  # ============================================================
+  # BLOC 5 — Carte anomalies
+  # ============================================================
+
+  make_anomaly_map <- function() {
+    if (is.null(anomaly)) {
+      message("  Anomaly raster not provided. Skipping.")
+      return(NULL)
+    }
+
+    message("  Creating anomaly map...")
+    df <- raster_to_df(anomaly[[1]], "anomaly")
+
+    anomaly_colors <- colorRampPalette(c(
+      "#2166AC", "#92C5DE", "#F7F7F7",
+      "#F4A582", "#D6604D", "#B2182B"
+    ))(100)
+
+    p <- ggplot2::ggplot(df, ggplot2::aes(x = x, y = y, fill = anomaly)) +
+      ggplot2::geom_raster() +
+      ggplot2::scale_fill_gradientn(
+        colors = anomaly_colors,
+        name   = "Anomaly (°C)"
+      ) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(size = 14, face = "bold"),
+        plot.subtitle = ggplot2::element_text(size = 10, color = "gray50"),
+        axis.title    = ggplot2::element_text(size = 9),
+        legend.title  = ggplot2::element_text(size = 9)
+      ) +
+      ggplot2::labs(
+        title    = "Thermal Anomalies",
+        subtitle = "Positive = warmer than average | Negative = cooler",
+        x        = "Longitude",
+        y        = "Latitude"
+      )
+
+    print(p)
+    p
+  }
+
+  # ============================================================
+  # BLOC 6 — Carte zones chaudes
+  # ============================================================
+
+  make_hot_zones_map <- function() {
+    if (is.null(hot_zones)) {
+      message("  Hot zones raster not provided. Skipping.")
+      return(NULL)
+    }
+
+    message("  Creating hot zones map...")
+
+    # Combiner hot et cold zones si disponibles
+    if (!is.null(anomaly)) {
+      df_base <- raster_to_df(anomaly[[1]], "anomaly")
+
+      p <- ggplot2::ggplot(df_base,
+                           ggplot2::aes(x = x, y = y, fill = anomaly)) +
+        ggplot2::geom_raster() +
+        ggplot2::scale_fill_gradientn(
+          colors = c("#4575B4", "#F7F7F7", "#D73027"),
+          name   = "Anomaly (°C)"
+        )
+    } else {
+      df_hot        <- raster_to_df(hot_zones[[1]], "value")
+      df_hot$zone   <- "Hot Zone"
+
+      p <- ggplot2::ggplot(df_hot,
+                           ggplot2::aes(x = x, y = y, fill = zone)) +
+        ggplot2::geom_raster() +
+        ggplot2::scale_fill_manual(
+          values = c("Hot Zone" = "#D73027"),
+          name   = "Zone"
+        )
+    }
+
+    p <- p +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(size = 14, face = "bold"),
+        plot.subtitle = ggplot2::element_text(size = 10, color = "gray50"),
+        axis.title    = ggplot2::element_text(size = 9)
+      ) +
+      ggplot2::labs(
+        title    = "Rural Heat Islands — Hot Zones",
+        subtitle = "Areas with significantly above-average temperatures",
+        x        = "Longitude",
+        y        = "Latitude"
+      )
+
+    print(p)
+    p
+  }
+
+  # ============================================================
+  # BLOC 7 — Carte zones thermiques
+  # ============================================================
+
+  make_thermal_zones_map <- function() {
+    if (is.null(thermal_zones)) {
+      message("  Thermal zones raster not provided. Skipping.")
+      return(NULL)
+    }
+
+    message("  Creating thermal zones map...")
+    df <- raster_to_df(thermal_zones[[1]], "zone")
+
+    zone_colors <- c(
+      "1" = "#4575B4",
+      "2" = "#91BFDB",
+      "3" = "#FC8D59",
+      "4" = "#D73027"
+    )
+
+    zone_labels <- c(
+      "1" = "Cool",
+      "2" = "Moderate",
+      "3" = "Warm",
+      "4" = "Hot"
+    )
+
+    df$zone_label <- zone_labels[as.character(round(df$zone))]
+    df$zone_label <- factor(df$zone_label,
+                            levels = c("Cool", "Moderate", "Warm", "Hot"))
+
+    p <- ggplot2::ggplot(df,
+                         ggplot2::aes(x = x, y = y, fill = zone_label)) +
+      ggplot2::geom_raster() +
+      ggplot2::scale_fill_manual(
+        values = c("Cool"     = "#4575B4",
+                   "Moderate" = "#91BFDB",
+                   "Warm"     = "#FC8D59",
+                   "Hot"      = "#D73027"),
+        name   = "Thermal Zone",
+        na.value = "white"
+      ) +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(
+        plot.title    = ggplot2::element_text(size = 14, face = "bold"),
+        plot.subtitle = ggplot2::element_text(size = 10, color = "gray50"),
+        axis.title    = ggplot2::element_text(size = 9),
+        legend.title  = ggplot2::element_text(size = 9)
+      ) +
+      ggplot2::labs(
+        title    = "Thermal Zone Classification",
+        subtitle = "K-means clustering of LST data",
+        x        = "Longitude",
+        y        = "Latitude"
+      )
+
+    print(p)
+    p
+  }
+
+  # ============================================================
+  # BLOC 8 — Générer les cartes demandées
+  # ============================================================
+
+  message("\nGenerating maps...")
+
+  if (map_type == "lst" || map_type == "all") {
+    plots$lst <- make_lst_map()
+  }
+  if (map_type == "ndvi" || map_type == "all") {
+    plots$ndvi <- make_ndvi_map()
+  }
+  if (map_type == "anomaly" || map_type == "all") {
+    plots$anomaly <- make_anomaly_map()
+  }
+  if (map_type == "hot_zones" || map_type == "all") {
+    plots$hot_zones <- make_hot_zones_map()
+  }
+  if (map_type == "thermal_zones" || map_type == "all") {
+    plots$thermal_zones <- make_thermal_zones_map()
+  }
+
+  # ============================================================
+  # BLOC 9 — Export
+  # ============================================================
+
+  if (export %in% c("png", "pdf")) {
+
+    message("\nExporting maps to ", toupper(export), "...")
+
+    for (map_name in names(plots)) {
+      if (!is.null(plots[[map_name]])) {
+
+        file_name <- file.path(
+          output_dir,
+          paste0(map_name, "_microclimate.", export)
+        )
+
+        if (export == "png") {
+          grDevices::png(file_name,
+                         width  = width,
+                         height = height,
+                         units  = "in",
+                         res    = 150)
+        } else {
+          grDevices::pdf(file_name, width = width, height = height)
+        }
+
+        print(plots[[map_name]])
+        grDevices::dev.off()
+
+        message("  Saved: ", file_name)
+      }
+    }
+  }
+
+  # ============================================================
+  # BLOC 10 — Résumé final
+  # ============================================================
+
+  n_maps <- sum(!sapply(plots, is.null))
+
+  message("\n========================================")
+  message("       Microclimate Mapping Complete!")
+  message("========================================")
+  message("  Maps generated : ", n_maps)
+  message("  Export format  : ", toupper(export))
+  message("  Output dir     : ", output_dir)
+  message("========================================")
+
+  invisible(plots)
+}
